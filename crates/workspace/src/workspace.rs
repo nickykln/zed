@@ -8712,10 +8712,12 @@ impl Workspace {
                 } else {
                     None
                 };
-                // With agent CLI sessions, an open dock takes the room of an
-                // empty editor area, and gives it back once a file opens.
-                let fills_empty_center =
-                    AgentSettings::get_global(cx).use_cli && self.center_is_empty(cx);
+                // With agent CLI sessions, the left dock takes the room of an
+                // empty editor area, and gives it back once a file opens. The
+                // right dock keeps its size.
+                let fills_empty_center = position == DockPosition::Left
+                    && AgentSettings::get_global(cx).use_cli
+                    && self.center_is_empty(cx);
                 if fills_empty_center {
                     let style = container.style();
                     style.flex_grow = Some(10_000.0);
