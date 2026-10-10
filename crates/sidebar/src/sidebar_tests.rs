@@ -6275,7 +6275,7 @@ async fn test_new_thread_button_works_after_adding_folder(cx: &mut TestAppContex
     // verify a new draft is created.
     let workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.create_new_thread(&workspace, window, cx);
+        sidebar.create_new_thread(&workspace, None, window, cx);
     });
     cx.run_until_parked();
 
@@ -10392,7 +10392,7 @@ async fn test_archive_thread_active_entry_management(cx: &mut TestAppContext) {
 
     // Explicitly create a draft on workspace_b so the sidebar tracks one.
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.create_new_thread(&workspace_b, window, cx);
+        sidebar.create_new_thread(&workspace_b, None, window, cx);
     });
     cx.run_until_parked();
 
@@ -12696,7 +12696,7 @@ async fn test_activating_workspace_with_draft_does_not_create_extras(cx: &mut Te
 
     // Explicitly create a draft on workspace_b so the sidebar tracks one.
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.create_new_thread(&workspace_b, window, cx);
+        sidebar.create_new_thread(&workspace_b, None, window, cx);
     });
     cx.run_until_parked();
 

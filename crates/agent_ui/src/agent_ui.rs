@@ -5,6 +5,7 @@ mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
 mod buffer_codegen;
+mod cli_session;
 mod completion_provider;
 mod config_options;
 mod context;
@@ -79,6 +80,10 @@ pub use crate::agent_panel::{
     AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, TerminalId, ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
+pub use crate::cli_session::{
+    CliAgent, open_new_thread_in_terminal_panel, open_thread_in_terminal_panel, rename_session,
+    session_id_for_terminal_label,
+};
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_metadata_store::ThreadId;
@@ -89,6 +94,7 @@ pub use external_source_prompt::ExternalSourcePrompt;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
 pub(crate) use model_selector_popover::ModelSelectorPopover;
+pub use terminal_view::terminal_panel::{TerminalPanel, TerminalPanelEvent};
 pub use thread_import::{
     AcpThreadImportOnboarding, CrossChannelImportOnboarding, ThreadImportModal,
     channels_with_threads, import_threads_from_other_channels,
@@ -1104,6 +1110,7 @@ mod tests {
             tool_permissions: Default::default(),
             sandbox_permissions: Default::default(),
             show_turn_stats: false,
+            use_cli: false,
             show_merge_conflict_indicator: true,
             max_idle_retained_threads: 5,
             threads_sidebar: agent_settings::ThreadsSidebarSettings {
