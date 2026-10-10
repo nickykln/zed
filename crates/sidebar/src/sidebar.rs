@@ -3641,21 +3641,6 @@ impl Sidebar {
         }
 
         if !found {
-            if AgentSettings::get_global(cx).use_cli
-                && let Some(metadata) = ThreadMetadataStore::global(cx)
-                    .read(cx)
-                    .entry(thread_id)
-                    .cloned()
-                && let Some(session_id) = metadata.session_id.as_ref()
-            {
-                agent_ui::rename_session(
-                    &metadata.agent_id,
-                    session_id,
-                    metadata.folder_paths().paths().first().cloned(),
-                    title.to_string(),
-                    cx,
-                );
-            }
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.set_title_override(thread_id, title, cx);
             });
@@ -3689,9 +3674,50 @@ impl Sidebar {
         }
     }
 
+    /// Passes a thread's new name on to its CLI session.
+    fn rename_cli_session(&self, thread_id: ThreadId, title: String, cx: &mut App) {
+        let Some(metadata) = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(session_id) = metadata.session_id.as_ref() else {
+            return;
+        };
+        let terminal_panels: Vec<_> = self
+            .multi_workspace
+            .upgrade()
+            .map(|multi_workspace| {
+                multi_workspace
+                    .read(cx)
+                    .workspaces()
+                    .filter_map(|workspace| workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx))
+                    .collect()
+            })
+            .unwrap_or_default();
+        agent_ui::rename_session(
+            &metadata.agent_id,
+            session_id,
+            metadata.folder_paths().paths().first().cloned(),
+            title,
+            &terminal_panels,
+            cx,
+        );
+    }
+
     fn finish_entry_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.rename_target.take().is_none() {
+        let Some(rename_target) = self.rename_target.take() else {
             return false;
+        };
+        if let RenameTarget::Thread(thread_id) = rename_target
+            && AgentSettings::get_global(cx).use_cli
+        {
+            let title = self.rename_editor.read(cx).text(cx);
+            if !title.is_empty() {
+                self.rename_cli_session(thread_id, title, cx);
+            }
         }
         self.focus_handle.focus(window, cx);
         self.update_entries(cx);

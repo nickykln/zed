@@ -251,18 +251,54 @@ pub fn session_id_for_terminal_label(label: &str, cx: &App) -> Option<acp_v2::Se
         })
 }
 
+/// Labels under which the terminal of a session may be found.
+fn session_terminal_labels(
+    agent: CliAgent,
+    session_id: &acp_v2::SessionId,
+    cx: &App,
+) -> Vec<String> {
+    let mut labels = vec![agent.resume_label(session_id)];
+    if let Some(started_label) = cx
+        .try_global::<CliSessions>()
+        .and_then(|sessions| sessions.started_terminal_labels.get(session_id))
+    {
+        labels.push(started_label.clone());
+    }
+    labels
+}
+
 /// Renames the CLI session of a thread. The title shown by the sidebar and
 /// the terminal tab follows through the title polling.
+///
+/// A Claude session that is running is renamed with its own `/rename`
+/// command, since it keeps its title in memory. Otherwise the name is
+/// appended to the files the CLI reads titles from.
 pub fn rename_session(
     agent_id: &AgentId,
     session_id: &acp_v2::SessionId,
     working_directory: Option<PathBuf>,
     title: String,
+    terminal_panels: &[Entity<TerminalPanel>],
     cx: &mut App,
 ) {
-    let (Some(agent), Some(working_directory)) =
-        (CliAgent::from_agent_id(agent_id), working_directory)
-    else {
+    let Some(agent) = CliAgent::from_agent_id(agent_id) else {
+        return;
+    };
+    if agent == CliAgent::Claude {
+        let labels = session_terminal_labels(agent, session_id, cx);
+        let command = format!("/rename {title}\r");
+        let sent = terminal_panels.iter().any(|terminal_panel| {
+            terminal_panel.update(cx, |terminal_panel, cx| {
+                labels
+                    .iter()
+                    .any(|label| terminal_panel.send_input_to_task_terminal(label, &command, cx))
+            })
+        });
+        if sent {
+            return;
+        }
+    }
+    let Some(working_directory) = working_directory else {
         return;
     };
     let session_id = session_id.clone();
@@ -305,13 +341,7 @@ pub fn open_thread_in_terminal_panel(
         );
     };
 
-    let mut reusable_labels = vec![agent.resume_label(session_id)];
-    if let Some(started_label) = cx
-        .try_global::<CliSessions>()
-        .and_then(|sessions| sessions.started_terminal_labels.get(session_id))
-    {
-        reusable_labels.push(started_label.clone());
-    }
+    let reusable_labels = session_terminal_labels(agent, session_id, cx);
     if let Some(working_directory) = working_directory.clone() {
         let thread_id = ThreadMetadataStore::global(cx)
             .read(cx)

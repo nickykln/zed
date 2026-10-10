@@ -820,6 +820,31 @@ impl TerminalPanel {
         true
     }
 
+    /// Types `input` in the terminal still running the task with this label.
+    /// Returns `false` when there is none.
+    pub fn send_input_to_task_terminal(&self, label: &str, input: &str, cx: &mut App) -> bool {
+        let running_terminal =
+            self.terminals_for_task(label, cx)
+                .into_iter()
+                .rev()
+                .find(|(_, _, terminal_view)| {
+                    terminal_view
+                        .read(cx)
+                        .terminal()
+                        .read(cx)
+                        .task()
+                        .is_some_and(|task_state| task_state.status == TaskStatus::Running)
+                });
+        let Some((_, _, terminal_view)) = running_terminal else {
+            return false;
+        };
+        let terminal = terminal_view.read(cx).terminal().clone();
+        terminal.update(cx, |terminal, _| {
+            terminal.input(input.as_bytes().to_vec());
+        });
+        true
+    }
+
     /// Renames the tabs of the terminals running the task with this label.
     pub fn set_task_terminal_title(&self, label: &str, title: &str, cx: &mut App) {
         for (_, _, terminal_view) in self.terminals_for_task(label, cx) {
