@@ -2809,6 +2809,13 @@ impl Workspace {
         Some((panel.clone(), size_state))
     }
 
+    fn center_is_empty(&self, cx: &App) -> bool {
+        self.center
+            .panes()
+            .into_iter()
+            .all(|pane| pane.read(cx).items_len() == 0)
+    }
+
     fn center_full_height_column_count(&self) -> f32 {
         self.center.full_height_column_count().max(1) as f32
     }
@@ -8705,7 +8712,16 @@ impl Workspace {
                 } else {
                     None
                 };
-                if let Some(grow) = flex_grow {
+                // With agent CLI sessions, an open dock takes the room of an
+                // empty editor area, and gives it back once a file opens.
+                let fills_empty_center =
+                    AgentSettings::get_global(cx).use_cli && self.center_is_empty(cx);
+                if fills_empty_center {
+                    let style = container.style();
+                    style.flex_grow = Some(10_000.0);
+                    style.flex_shrink = Some(1.0);
+                    style.flex_basis = Some(relative(0.).into());
+                } else if let Some(grow) = flex_grow {
                     let grow = (grow / self.center_full_height_column_count()).max(0.001);
                     let style = container.style();
                     style.flex_grow = Some(grow);

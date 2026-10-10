@@ -18,9 +18,10 @@ use gpui::{
 use itertools::Itertools;
 use project::{Fs, Project};
 
+use agent_settings::AgentSettings;
 use settings::{Settings, TerminalDockPosition};
 use task::{RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
-use terminal::{Terminal, terminal_settings::TerminalSettings};
+use terminal::{TaskStatus, Terminal, terminal_settings::TerminalSettings};
 use ui::{
     ButtonLike, Clickable, CommonAnimationExt, ContextMenu, FluentBuilder, PopoverMenu,
     SplitButton, Toggleable, Tooltip, prelude::*,
@@ -290,7 +291,9 @@ impl TerminalPanel {
             self.serialize(cx);
         }
         cx.notify();
-        if self.active && self.has_no_terminals(cx) {
+        // Agent CLI sessions can't be restored, so the panel is left empty
+        // instead of opening a shell nobody asked for.
+        if self.active && self.has_no_terminals(cx) && !AgentSettings::get_global(cx).use_cli {
             let working_directory = self
                 .workspace
                 .update(cx, |workspace, cx| default_working_directory(workspace, cx))
@@ -433,7 +436,20 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) {
         match event {
-            pane::Event::ActivateItem { .. } => self.serialize(cx),
+            pane::Event::ActivateItem { .. } => {
+                self.serialize(cx);
+                let activated_task_label = pane
+                    .read(cx)
+                    .active_item()
+                    .and_then(|item| item.downcast::<TerminalView>())
+                    .and_then(|terminal_view| {
+                        let terminal = terminal_view.read(cx).terminal().read(cx);
+                        Some(terminal.task()?.spawned_task.full_label.clone())
+                    });
+                if let Some(label) = activated_task_label {
+                    cx.emit(TerminalPanelEvent::TaskTerminalActivated { label });
+                }
+            }
             pane::Event::RemovedItem { .. } => self.serialize(cx),
             pane::Event::Remove { focus_on_pane } => {
                 let pane_count_before_removal = self.center.panes().len();
@@ -775,6 +791,42 @@ impl TerminalPanel {
                 )
             })
             .detach_and_log_err(cx);
+    }
+
+    /// Focuses the terminal still running the task with this label.
+    /// Returns `false` when there is none, so the caller can spawn it.
+    pub fn activate_running_task_terminal(
+        &self,
+        label: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let running_terminal =
+            self.terminals_for_task(label, cx)
+                .into_iter()
+                .rev()
+                .find(|(_, _, terminal_view)| {
+                    terminal_view
+                        .read(cx)
+                        .terminal()
+                        .read(cx)
+                        .task()
+                        .is_some_and(|task_state| task_state.status == TaskStatus::Running)
+                });
+        let Some((item_index, pane, _)) = running_terminal else {
+            return false;
+        };
+        self.activate_terminal_view(&pane, item_index, true, window, cx);
+        true
+    }
+
+    /// Renames the tabs of the terminals running the task with this label.
+    pub fn set_task_terminal_title(&self, label: &str, title: &str, cx: &mut App) {
+        for (_, _, terminal_view) in self.terminals_for_task(label, cx) {
+            terminal_view.update(cx, |terminal_view, cx| {
+                terminal_view.set_custom_title(Some(title.to_string()), cx);
+            });
+        }
     }
 
     fn terminals_for_task(
@@ -1470,6 +1522,13 @@ impl workspace::Item for FailedToSpawnTerminal {
 
 impl EventEmitter<PanelEvent> for TerminalPanel {}
 
+pub enum TerminalPanelEvent {
+    /// A terminal running a task became the active tab of one of the panel's panes.
+    TaskTerminalActivated { label: String },
+}
+
+impl EventEmitter<TerminalPanelEvent> for TerminalPanel {}
+
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let registrar = cx
@@ -1745,7 +1804,14 @@ impl Panel for TerminalPanel {
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         let old_active = self.active;
         self.active = active;
-        if !active || old_active == active || self.restoring || !self.has_no_terminals(cx) {
+        // Agent CLI sessions start their own terminal, so an empty panel must
+        // not open a shell next to them.
+        if !active
+            || old_active == active
+            || self.restoring
+            || !self.has_no_terminals(cx)
+            || AgentSettings::get_global(cx).use_cli
+        {
             return;
         }
         cx.defer_in(window, |this, window, cx| {

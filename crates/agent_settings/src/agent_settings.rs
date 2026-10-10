@@ -247,6 +247,7 @@ pub struct AgentSettings {
     pub use_modifier_to_send: bool,
     pub message_editor_min_lines: usize,
     pub show_turn_stats: bool,
+    pub use_cli: bool,
     pub show_merge_conflict_indicator: bool,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
@@ -262,6 +263,12 @@ pub struct ThreadsSidebarSettings {
 impl AgentSettings {
     pub fn enabled(&self, cx: &App) -> bool {
         self.enabled && !DisableAiSettings::get_global(cx).disable_ai
+    }
+
+    /// Whether the agent panel button is shown. It is hidden when threads run
+    /// in the terminal panel.
+    pub fn button_visible(&self) -> bool {
+        self.button && !self.use_cli
     }
 
     pub fn temperature_for_model(model: &LanguageModel, cx: &App) -> Option<f32> {
@@ -843,6 +850,7 @@ impl Settings for AgentSettings {
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),
+            use_cli: agent.use_cli.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
