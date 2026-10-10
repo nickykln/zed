@@ -13,6 +13,7 @@ use workspace::{PathList, Workspace};
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const ENTER_DELAY: Duration = Duration::from_millis(500);
 const CODEX_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Agents that ship a command line client which can run in the terminal panel.
@@ -270,9 +271,9 @@ fn session_terminal_labels(
 /// Renames the CLI session of a thread. The title shown by the sidebar and
 /// the terminal tab follows through the title polling.
 ///
-/// A Claude session that is running is renamed with its own `/rename`
-/// command, since it keeps its title in memory. Otherwise the name is
-/// appended to the files the CLI reads titles from.
+/// A running session is renamed with its own `/rename` command, since it
+/// keeps its title in memory. Otherwise the name is appended to the files the
+/// CLI reads titles from.
 pub fn rename_session(
     agent_id: &AgentId,
     session_id: &acp_v2::SessionId,
@@ -284,20 +285,39 @@ pub fn rename_session(
     let Some(agent) = CliAgent::from_agent_id(agent_id) else {
         return;
     };
-    if agent == CliAgent::Claude {
-        let labels = session_terminal_labels(agent, session_id, cx);
-        let command = format!("/rename {title}\r");
-        let sent = terminal_panels.iter().any(|terminal_panel| {
-            terminal_panel.update(cx, |terminal_panel, cx| {
-                labels
-                    .iter()
-                    .any(|label| terminal_panel.send_input_to_task_terminal(label, &command, cx))
+    let labels = session_terminal_labels(agent, session_id, cx);
+    // Codex takes a fast burst of input for a paste and doesn't submit it, so
+    // its Enter has to be a separate keypress.
+    let (rename_command, enter_is_separate) = match agent {
+        CliAgent::Claude => (format!("/rename {title}\r"), false),
+        CliAgent::Codex => (format!("/rename {title}"), true),
+    };
+    let running_terminal = terminal_panels.iter().find_map(|terminal_panel| {
+        let label = terminal_panel.update(cx, |terminal_panel, cx| {
+            labels
+                .iter()
+                .find(|label| {
+                    terminal_panel.send_input_to_task_terminal(label, &rename_command, cx)
+                })
+                .cloned()
+        })?;
+        Some((terminal_panel.downgrade(), label))
+    });
+    if let Some((terminal_panel, label)) = running_terminal {
+        if enter_is_separate {
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(ENTER_DELAY).await;
+                terminal_panel
+                    .update(cx, |terminal_panel, cx| {
+                        terminal_panel.send_input_to_task_terminal(&label, "\r", cx);
+                    })
+                    .log_err();
             })
-        });
-        if sent {
-            return;
+            .detach();
         }
+        return;
     }
+
     let Some(working_directory) = working_directory else {
         return;
     };
