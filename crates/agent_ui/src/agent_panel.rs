@@ -1952,6 +1952,11 @@ impl AgentPanel {
     /// it, so the agent is launched the next time the panel is opened (or
     /// right away, if the panel is already showing the empty new-thread
     /// draft).
+    /// Makes `agent` the one used for the threads created from now on.
+    pub fn select_agent_for_new_threads(&mut self, agent: Agent, cx: &mut Context<Self>) {
+        self.set_selected_agent_and_persist(agent, cx);
+    }
+
     pub fn select_agent(&mut self, agent: Agent, window: &mut Window, cx: &mut Context<Self>) {
         if self.project.read(cx).is_via_collab() && !agent.is_native() {
             return;
@@ -5120,7 +5125,8 @@ impl Panel for AgentPanel {
     }
 
     fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
-        (self.enabled(cx) && AgentSettings::get_global(cx).button).then_some(IconName::ZedAssistant)
+        (self.enabled(cx) && AgentSettings::get_global(cx).button_visible())
+            .then_some(IconName::ZedAssistant)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

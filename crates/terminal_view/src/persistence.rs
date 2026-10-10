@@ -1,3 +1,4 @@
+use agent_settings::AgentSettings;
 use anyhow::Result;
 use async_recursion::async_recursion;
 use collections::HashSet;
@@ -5,6 +6,7 @@ use futures::future::join_all;
 use gpui::{AppContext as _, AsyncWindowContext, Axis, Entity, Task, WeakEntity};
 use project::Project;
 use serde::{Deserialize, Serialize};
+use settings::Settings as _;
 use std::path::PathBuf;
 use ui::{App, Context, Window};
 use util::ResultExt as _;
@@ -275,8 +277,12 @@ async fn deserialize_pane_group(
                         pane.set_pinned_count(pinned_count.min(pane.items_len()));
                         pane.items_len()
                     });
-                    // Avoid blank panes in splits
-                    if items.is_ok_and(|items| items == 0) {
+                    // Avoid blank panes in splits. Agent CLI sessions can't be
+                    // restored, so their panel is left empty instead.
+                    let use_cli = workspace
+                        .update(cx, |_, cx| AgentSettings::get_global(cx).use_cli)
+                        .unwrap_or(false);
+                    if items.is_ok_and(|items| items == 0) && !use_cli {
                         let working_directory = workspace
                             .update(cx, |workspace, cx| default_working_directory(workspace, cx))
                             .ok()

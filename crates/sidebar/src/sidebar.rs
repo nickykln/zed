@@ -747,25 +747,30 @@ enum DefaultBranchCache {
 }
 
 // Mirrors the behavior of the worktree picker's "Create new worktree" entries.
-fn create_worktree_in_workspace(
-    workspace: &Entity<Workspace>,
-    branch_target: NewWorktreeBranchTarget,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    workspace.update(cx, |workspace, cx| {
-        let focused_dock = workspace.focused_dock_position(window, cx);
-        git_ui_core::worktree_service::handle_create_worktree(
-            workspace,
-            &CreateWorktree {
-                worktree_name: None,
-                branch_target,
-            },
-            window,
-            focused_dock,
-            cx,
-        );
-    });
+/// What a new session started from the sidebar runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewSessionAgent {
+    ZedAgent,
+    Terminal,
+    Cli(agent_ui::CliAgent),
+}
+
+impl NewSessionAgent {
+    fn name(self) -> &'static str {
+        match self {
+            NewSessionAgent::ZedAgent => "Zed Agent",
+            NewSessionAgent::Terminal => "Terminal",
+            NewSessionAgent::Cli(agent) => agent.name(),
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            NewSessionAgent::ZedAgent => IconName::ZedAgent,
+            NewSessionAgent::Terminal => IconName::Terminal,
+            NewSessionAgent::Cli(agent) => agent.icon(),
+        }
+    }
 }
 
 /// The sidebar re-derives its entire entry list from scratch on every
@@ -821,6 +826,7 @@ pub struct Sidebar {
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     project_header_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_new_thread_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
+    new_session_agent: NewSessionAgent,
     project_header_menu_ix: Option<usize>,
     worktree_default_branches: HashMap<ProjectGroupKey, DefaultBranchCache>,
     _subscriptions: Vec<gpui::Subscription>,
@@ -972,6 +978,7 @@ impl Sidebar {
             recent_projects_popover_handle: PopoverMenuHandle::default(),
             project_header_menu_handles: HashMap::new(),
             project_header_new_thread_menu_handles: HashMap::new(),
+            new_session_agent: NewSessionAgent::Cli(agent_ui::CliAgent::Claude),
             project_header_menu_ix: None,
             worktree_default_branches: HashMap::new(),
             _subscriptions: Vec::new(),
@@ -1072,6 +1079,9 @@ impl Sidebar {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
                         this.schedule_update_entries(false, cx);
                     }
+                    if let Ok(terminal_panel) = view.clone().downcast::<agent_ui::TerminalPanel>() {
+                        this.subscribe_to_terminal_panel(workspace, &terminal_panel, window, cx);
+                    }
                 }
             },
         )
@@ -1082,6 +1092,62 @@ impl Sidebar {
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
             self.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
         }
+        if let Some(terminal_panel) = workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx) {
+            self.subscribe_to_terminal_panel(workspace, &terminal_panel, window, cx);
+        }
+    }
+
+    fn subscribe_to_terminal_panel(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        terminal_panel: &Entity<agent_ui::TerminalPanel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = workspace.downgrade();
+        cx.subscribe_in(
+            terminal_panel,
+            window,
+            move |this, _, event: &agent_ui::TerminalPanelEvent, _window, cx| match event {
+                agent_ui::TerminalPanelEvent::TaskTerminalActivated { label } => {
+                    if let Some(workspace) = workspace.upgrade() {
+                        this.sync_active_entry_from_terminal_tab(&workspace, label, cx);
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// Selects the thread whose CLI session runs in the activated terminal tab.
+    fn sync_active_entry_from_terminal_tab(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !AgentSettings::get_global(cx).use_cli {
+            return;
+        }
+        let Some(session_id) = agent_ui::session_id_for_terminal_label(label, cx) else {
+            return;
+        };
+        if self.active_workspace(cx).as_ref() != Some(workspace) {
+            return;
+        }
+        let Some(thread_id) = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&session_id)
+            .map(|metadata| metadata.thread_id)
+        else {
+            return;
+        };
+        self.active_entry = Some(ActiveEntry::Thread {
+            thread_id,
+            session_id: Some(session_id),
+            workspace: workspace.clone(),
+        });
+        self.schedule_update_entries(false, cx);
     }
 
     fn move_entry_paths(
@@ -1207,7 +1273,7 @@ impl Sidebar {
             .entry(thread_id)
             .is_some_and(|m| m.archived);
         if is_archived {
-            self.create_new_thread(&workspace, window, cx);
+            self.create_new_thread(&workspace, None, window, cx);
         }
     }
 
@@ -2649,6 +2715,55 @@ impl Sidebar {
                 window,
                 cx,
                 move |mut menu, _window, cx| {
+                    if AgentSettings::get_global(cx).use_cli {
+                        let selected_agent = this
+                            .read_with(cx, |sidebar, _| sidebar.new_session_agent)
+                            .unwrap_or(NewSessionAgent::Cli(agent_ui::CliAgent::Claude));
+                        menu =
+                            menu.submenu_with_icon(selected_agent.name(), selected_agent.icon(), {
+                                let this = this.clone();
+                                move |mut submenu, _window, _cx| {
+                                    let agent_entry = |agent: NewSessionAgent| {
+                                        let this = this.clone();
+                                        ContextMenuEntry::new(agent.name())
+                                            .icon(agent.icon())
+                                            .icon_color(Color::Muted)
+                                            .toggleable(IconPosition::End, agent == selected_agent)
+                                            .handler(move |_window, cx| {
+                                                this.update(cx, |sidebar, cx| {
+                                                    sidebar.new_session_agent = agent;
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                            })
+                                    };
+                                    submenu = submenu
+                                        .item(agent_entry(NewSessionAgent::ZedAgent))
+                                        .item(agent_entry(NewSessionAgent::Terminal))
+                                        .separator()
+                                        .header("External Agents")
+                                        .item(agent_entry(NewSessionAgent::Cli(
+                                            agent_ui::CliAgent::Claude,
+                                        )))
+                                        .item(agent_entry(NewSessionAgent::Cli(
+                                            agent_ui::CliAgent::Codex,
+                                        )))
+                                        .separator();
+                                    submenu.item(
+                                        ContextMenuEntry::new("Add More Agents")
+                                            .icon(IconName::Plus)
+                                            .icon_color(Color::Muted)
+                                            .handler(|window, cx| {
+                                                window.dispatch_action(
+                                                    Box::new(zed_actions::AcpRegistry),
+                                                    cx,
+                                                )
+                                            }),
+                                    )
+                                }
+                            });
+                        menu = menu.separator();
+                    }
                     menu = menu.header("New Thread In…");
 
                     for (workspace, labels) in open_workspaces
@@ -2755,13 +2870,17 @@ impl Sidebar {
                                     );
                                     let branch_target = target.branch_target();
                                     let workspace = base_workspace.clone();
+                                    let this = this.clone();
                                     submenu = submenu.entry(label, None, move |window, cx| {
-                                        create_worktree_in_workspace(
-                                            &workspace,
-                                            branch_target.clone(),
-                                            window,
-                                            cx,
-                                        );
+                                        this.update(cx, |sidebar, cx| {
+                                            sidebar.create_worktree_and_new_entry(
+                                                &workspace,
+                                                branch_target.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
                                     });
                                 }
 
@@ -3555,9 +3674,50 @@ impl Sidebar {
         }
     }
 
+    /// Passes a thread's new name on to its CLI session.
+    fn rename_cli_session(&self, thread_id: ThreadId, title: String, cx: &mut App) {
+        let Some(metadata) = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(session_id) = metadata.session_id.as_ref() else {
+            return;
+        };
+        let terminal_panels: Vec<_> = self
+            .multi_workspace
+            .upgrade()
+            .map(|multi_workspace| {
+                multi_workspace
+                    .read(cx)
+                    .workspaces()
+                    .filter_map(|workspace| workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx))
+                    .collect()
+            })
+            .unwrap_or_default();
+        agent_ui::rename_session(
+            &metadata.agent_id,
+            session_id,
+            metadata.folder_paths().paths().first().cloned(),
+            title,
+            &terminal_panels,
+            cx,
+        );
+    }
+
     fn finish_entry_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.rename_target.take().is_none() {
+        let Some(rename_target) = self.rename_target.take() else {
             return false;
+        };
+        if let RenameTarget::Thread(thread_id) = rename_target
+            && AgentSettings::get_global(cx).use_cli
+        {
+            let title = self.rename_editor.read(cx).text(cx);
+            if !title.is_empty() {
+                self.rename_cli_session(thread_id, title, cx);
+            }
         }
         self.focus_handle.focus(window, cx);
         self.update_entries(cx);
@@ -4048,6 +4208,60 @@ impl Sidebar {
         }
     }
 
+    fn open_thread_in_terminal_panel(
+        &mut self,
+        metadata: &ThreadMetadata,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let session_id = metadata.session_id.as_ref();
+        let working_directory = metadata.folder_paths().paths().first().cloned();
+
+        if self.pending_thread_activation == Some(metadata.thread_id) {
+            self.pending_thread_activation = None;
+        }
+
+        if self
+            .find_workspace_in_current_window(cx, |candidate, _| candidate == workspace)
+            .is_some()
+        {
+            if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+                multi_workspace.update(cx, |multi_workspace, cx| {
+                    multi_workspace.activate(workspace.clone(), None, window, cx);
+                });
+            }
+            return agent_ui::open_thread_in_terminal_panel(
+                workspace,
+                &metadata.agent_id,
+                session_id,
+                working_directory,
+                window,
+                cx,
+            );
+        }
+
+        let Some((target_window, workspace)) =
+            self.find_workspace_across_windows(cx, |candidate, _| candidate == workspace)
+        else {
+            return false;
+        };
+        target_window
+            .update(cx, |multi_workspace, window, cx| {
+                window.activate_window();
+                multi_workspace.activate(workspace.clone(), None, window, cx);
+                agent_ui::open_thread_in_terminal_panel(
+                    &workspace,
+                    &metadata.agent_id,
+                    session_id,
+                    working_directory,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap_or(false)
+    }
+
     fn activate_thread(
         &mut self,
         metadata: ThreadMetadata,
@@ -4056,6 +4270,12 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if AgentSettings::get_global(cx).use_cli
+            && self.open_thread_in_terminal_panel(&metadata, workspace, window, cx)
+        {
+            return;
+        }
+
         if self
             .find_workspace_in_current_window(cx, |candidate, _| candidate == workspace)
             .is_some()
@@ -7027,10 +7247,37 @@ impl Sidebar {
             return;
         }
 
-        if self.should_create_terminal_for_workspace(workspace, cx) {
-            self.create_new_terminal(workspace, window, cx);
-        } else {
-            self.create_new_thread(workspace, window, cx);
+        if !AgentSettings::get_global(cx).use_cli {
+            if self.should_create_terminal_for_workspace(workspace, cx) {
+                self.create_new_terminal(workspace, window, cx);
+            } else {
+                self.create_new_thread(workspace, None, window, cx);
+            }
+            return;
+        }
+
+        if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.activate(workspace.clone(), None, window, cx);
+            });
+        }
+        match self.new_session_agent {
+            NewSessionAgent::Cli(agent) => {
+                if agent_ui::open_new_thread_in_terminal_panel(
+                    workspace,
+                    agent,
+                    workspace_path_list(workspace, cx),
+                    window,
+                    cx,
+                ) {
+                    return;
+                }
+                self.create_new_thread(workspace, None, window, cx);
+            }
+            NewSessionAgent::ZedAgent => {
+                self.create_new_thread(workspace, Some(agent_ui::Agent::NativeAgent), window, cx);
+            }
+            NewSessionAgent::Terminal => self.create_new_terminal(workspace, window, cx),
         }
     }
 
@@ -7045,9 +7292,58 @@ impl Sidebar {
             .is_some_and(|panel| panel.read(cx).should_create_terminal_for_new_entry(cx))
     }
 
+    /// Creates a worktree workspace, then starts a new session in it the same
+    /// way [`Self::create_new_entry`] does.
+    fn create_worktree_and_new_entry(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        branch_target: NewWorktreeBranchTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !AgentSettings::get_global(cx).use_cli {
+            workspace.update(cx, |workspace, cx| {
+                let focused_dock = workspace.focused_dock_position(window, cx);
+                git_ui_core::worktree_service::handle_create_worktree(
+                    workspace,
+                    &CreateWorktree {
+                        worktree_name: None,
+                        branch_target,
+                    },
+                    window,
+                    focused_dock,
+                    cx,
+                );
+            });
+            return;
+        }
+
+        let creation = workspace.update(cx, |workspace, cx| {
+            let focused_dock = workspace.focused_dock_position(window, cx);
+            git_ui_core::worktree_service::create_worktree_workspace(
+                workspace,
+                &CreateWorktree {
+                    worktree_name: None,
+                    branch_target,
+                },
+                window,
+                focused_dock,
+                cx,
+            )
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let created = creation.await?;
+            this.update_in(cx, |sidebar, window, cx| {
+                sidebar.create_new_entry(&created.workspace, window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn create_new_thread(
         &mut self,
         workspace: &Entity<Workspace>,
+        agent: Option<agent_ui::Agent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -7066,6 +7362,9 @@ impl Sidebar {
         let draft_id = workspace.update(cx, |workspace, cx| {
             let panel = workspace.panel::<AgentPanel>(cx)?;
             let draft_id = panel.update(cx, |panel, cx| {
+                if let Some(agent) = agent {
+                    panel.select_agent_for_new_threads(agent, cx);
+                }
                 panel.activate_new_thread(true, AgentThreadSource::Sidebar, window, cx);
                 panel.active_thread_id(cx)
             });

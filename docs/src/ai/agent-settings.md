@@ -118,6 +118,25 @@ Use `Add Agent` to:
 
 For setup details and support boundaries, see [External Agents](./external-agents.md).
 
+## Command Line Agents {#command-line-agents}
+
+Set `agent.use_cli` to `true` to run the command line client of Claude or Codex in the terminal panel, instead of the agent panel:
+
+```json [settings]
+{
+  "agent": {
+    "use_cli": true
+  }
+}
+```
+
+With this setting:
+
+- Starting a thread from the sidebar opens a new terminal that runs `claude` or `codex`. The `+` menu of a project picks the agent.
+- Clicking a thread resumes its session in the terminal panel, or focuses its terminal if it is still running.
+- The thread title follows the title of the CLI session, in the sidebar and on the terminal tab.
+- The agent panel button is hidden, and the terminal panel no longer opens an empty shell on its own.
+
 ## MCP Servers {#mcp-servers}
 
 The `MCP Servers` page configures Model Context Protocol servers connected to Zed.
