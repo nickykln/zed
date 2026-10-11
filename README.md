@@ -1,7 +1,32 @@
 > [!IMPORTANT]
 > Remove this line to confirm you've reviewed this PR before submitting.
 
-> **Fork with CLI agents:** run Claude and Codex in the terminal panel with `agent.use_cli`. [Download for macOS (Apple Silicon)](https://github.com/nickykln/zed/releases/latest)
+## About this fork
+
+This is a fork of [Zed](https://github.com/zed-industries/zed) with one extra feature: an opt-in `agent.use_cli` setting.
+
+**Why?** Many people prefer the official command line clients of their agents (Claude Code, Codex) over the agent panel. But Zed's thread sidebar only knows about threads from the agent panel. With this fork, the sidebar keeps organizing your sessions, and the CLI does the work.
+
+**What it does** when `agent.use_cli` is `true`:
+
+- Starting a thread from the sidebar runs `claude` or `codex` in the terminal panel.
+- Clicking a thread resumes its session, or focuses its terminal tab if it is still running.
+- Titles stay in sync both ways. Renaming a thread renames the CLI session.
+- The agent panel button is hidden, and the terminal panel no longer opens an empty shell.
+- The left dock takes the free width while no file is open.
+
+Nothing changes when the setting is off, which is the default. The rest of Zed is untouched.
+
+**Try it**
+
+1. [Download the macOS build](https://github.com/nickykln/zed/releases/latest) (Apple Silicon only, not notarized: right-click > Open on first launch).
+2. Add this to your settings:
+
+```json
+{ "agent": { "use_cli": true } }
+```
+
+The code lives on the [`use-cli-agents-upstream`](https://github.com/nickykln/zed/tree/use-cli-agents-upstream) branch. Known limitations are listed in the [first pull request](https://github.com/nickykln/zed/pull/1).
 
 # Zed
 
