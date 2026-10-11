@@ -1,3 +1,8 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
+> **Fork with CLI agents:** run Claude and Codex in the terminal panel with `agent.use_cli`. [Download for macOS (Apple Silicon)](https://github.com/nickykln/zed/releases/latest)
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
