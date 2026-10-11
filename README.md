@@ -1,6 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-
 ## About this fork
 
 This is a fork of [Zed](https://github.com/zed-industries/zed) with one extra feature: an opt-in `agent.use_cli` setting.
