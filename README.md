@@ -1,6 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-
 # Zed CLI
 
 A fork of [Zed](https://github.com/zed-industries/zed) that runs the Claude Code and Codex command line clients inside Zed, with their sessions listed in the threads sidebar.
