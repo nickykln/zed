@@ -389,9 +389,9 @@ pub struct AgentSettingsContent {
     pub show_turn_stats: Option<bool>,
     /// Whether threads run the agent's command line client (Claude, Codex) in
     /// the terminal panel instead of the agent panel. This also hides the agent
-    /// panel button.
+    /// panel button. Set it to false to go back to the agent panel.
     ///
-    /// Default: false
+    /// Default: true
     pub use_cli: Option<bool>,
     /// Whether to show the merge conflict indicator in the status bar
     /// that offers to resolve conflicts using the agent.

@@ -1408,10 +1408,10 @@
     "show_turn_stats": false,
     // Whether threads run the agent's command line client (Claude, Codex) in
     // the terminal panel instead of the agent panel. This also hides the agent
-    // panel button.
+    // panel button. Set it to false to go back to the agent panel.
     //
-    // Default: false
-    "use_cli": false,
+    // Default: true
+    "use_cli": true,
     // Whether to show the merge conflict indicator in the status bar
     // that offers to resolve conflicts using the agent.
     //

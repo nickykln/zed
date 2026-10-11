@@ -120,12 +120,12 @@ For setup details and support boundaries, see [External Agents](./external-agent
 
 ## Command Line Agents {#command-line-agents}
 
-Set `agent.use_cli` to `true` to run the command line client of Claude or Codex in the terminal panel, instead of the agent panel:
+By default, `agent.use_cli` is `true`: threads run the command line client of Claude or Codex in the terminal panel, instead of the agent panel. To go back to the agent panel, set it to `false`:
 
 ```json [settings]
 {
   "agent": {
-    "use_cli": true
+    "use_cli": false
   }
 }
 ```

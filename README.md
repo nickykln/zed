@@ -9,7 +9,7 @@ A fork of [Zed](https://github.com/zed-industries/zed) that runs the Claude Code
 
 Many people prefer the official command line clients of their agents over the agent panel. But Zed's threads sidebar only knows about threads from the agent panel, so CLI sessions are invisible to it.
 
-This fork adds an opt-in setting, `agent.use_cli`. When it is `true`:
+This fork adds a setting, `agent.use_cli`, which is `true` by default. When it is `true`:
 
 - Starting a thread from the sidebar runs `claude` or `codex` in the terminal panel.
 - Clicking a thread resumes its session, or focuses its terminal tab if it is still running.
@@ -17,7 +17,9 @@ This fork adds an opt-in setting, `agent.use_cli`. When it is `true`:
 - The agent panel button is hidden, and the terminal panel no longer opens an empty shell.
 - The left dock takes the free width while no file is open.
 
-Nothing changes when the setting is off, which is the default. The rest of Zed is untouched.
+Nothing changes when the setting is `false`. The rest of Zed is untouched.
+
+To turn it off and go back to the agent panel, see [Turn it off](#turn-it-off).
 
 The code is on the [`use-cli-agents-upstream`](https://github.com/nickykln/zed/tree/use-cli-agents-upstream) branch. Known limitations are listed in the [first pull request](https://github.com/nickykln/zed/pull/1).
 
@@ -31,11 +33,7 @@ The code is on the [`use-cli-agents-upstream`](https://github.com/nickykln/zed/t
    xattr -cr "/Applications/Zed Dev.app"
    ```
 
-4. Add this to your Zed settings:
-
-   ```json
-   { "agent": { "use_cli": true } }
-   ```
+4. That's it: CLI agents are on by default.
 
 Requirements:
 
@@ -43,6 +41,16 @@ Requirements:
 - The `claude` and/or `codex` command installed and available in your `PATH`.
 
 The app is named "Zed Dev" and can be installed next to the official Zed.
+
+## Turn it off
+
+Add this to your Zed settings (`cmd-,`, then open the settings file) to go back to the agent panel:
+
+```json
+{ "agent": { "use_cli": false } }
+```
+
+The change applies right away. Remove the line to turn CLI agents back on.
 
 ## Upstream
 
