@@ -27,7 +27,7 @@ The code is on the [`use-cli-agents-upstream`](https://github.com/nickykln/zed/t
 3. The app is not notarized. On first launch, right-click > Open, or run:
 
    ```sh
-   xattr -cr "/Applications/Zed Dev.app"
+   xattr -cr "/Applications/Zed CLI.app"
    ```
 
 4. That's it: CLI agents are on by default.
@@ -37,7 +37,7 @@ Requirements:
 - macOS on Apple Silicon (no Intel build).
 - The `claude` and/or `codex` command installed and available in your `PATH`.
 
-The app is named "Zed Dev" and can be installed next to the official Zed.
+The app is named "Zed CLI" and can be installed next to the official Zed.
 
 ## Turn it off
 
