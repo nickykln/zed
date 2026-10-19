@@ -26,6 +26,7 @@ use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle, RootBlockContent, RootBlockDecoration, RootBlockGutter,
 };
+use project::git_store::GitStoreEvent;
 use project::search::SearchQuery;
 use project::{Project, ProjectPath, image_store};
 use settings::{SeedQuerySetting, Settings, update_settings_file};
@@ -95,6 +96,8 @@ pub struct MarkdownPreviewView {
     language_registry: Arc<LanguageRegistry>,
     show_changes: bool,
     changes: Option<PreviewChanges>,
+    /// Reloads the changes when the project switches what it diffs against.
+    _git_store_subscription: Option<Subscription>,
 }
 
 /// Changes of the previewed buffer since the last commit.
@@ -458,6 +461,7 @@ impl MarkdownPreviewView {
                 language_registry,
                 show_changes: false,
                 changes: None,
+                _git_store_subscription: None,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -630,6 +634,7 @@ impl MarkdownPreviewView {
         });
         self.update_markdown_from_active_editor(false, true, window, cx);
         if self.show_changes {
+            self.changes = None;
             self.load_changes(window, cx);
         }
         if had_active_editor {
@@ -765,32 +770,51 @@ impl MarkdownPreviewView {
 
     fn toggle_changes(&mut self, _: &ToggleChanges, window: &mut Window, cx: &mut Context<Self>) {
         self.show_changes = !self.show_changes;
+        self.changes = None;
         if self.show_changes {
             self.load_changes(window, cx);
         } else {
-            self.changes = None;
+            self._git_store_subscription = None;
         }
         cx.notify();
     }
 
-    /// Loads the diff of the previewed buffer against its last commit.
+    /// Loads the diff of the previewed buffer that editors show in the gutter:
+    /// against the last commit, or against the base of the branch.
     fn load_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.changes = None;
         let Some(buffer) = self.active_buffer(cx) else {
             return;
         };
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let project = workspace.read(cx).project().clone();
-        let buffer_diff = project.update(cx, |project, cx| {
-            project.open_uncommitted_diff(buffer.clone(), cx)
+        let git_store = workspace.read(cx).project().read(cx).git_store().clone();
+        self._git_store_subscription = Some(cx.subscribe_in(
+            &git_store,
+            window,
+            |this, _, event: &GitStoreEvent, window, cx| {
+                if let GitStoreEvent::DiffBaseChanged(_) = event
+                    && this.show_changes
+                {
+                    this.load_changes(window, cx);
+                }
+            },
+        ));
+        let buffer_diff = git_store.update(cx, |git_store, cx| {
+            git_store.open_display_diff(buffer.clone(), cx)
         });
         cx.spawn_in(window, async move |this, cx| {
             let buffer_diff = buffer_diff.await?;
             this.update_in(cx, |this, window, cx| {
                 // The preview may have moved on while the diff was loading.
                 if !this.show_changes || this.active_buffer(cx) != Some(buffer) {
+                    return;
+                }
+                let is_loaded = this
+                    .changes
+                    .as_ref()
+                    .is_some_and(|changes| changes.buffer_diff == buffer_diff);
+                if is_loaded {
                     return;
                 }
                 let subscription = cx.subscribe_in(
@@ -2354,9 +2378,9 @@ impl Render for MarkdownPreviewView {
                         .icon_size(IconSize::Small)
                         .toggle_state(self.show_changes)
                         .tooltip(Tooltip::text(if self.show_changes {
-                            "Hide Changes Since Last Commit"
+                            "Hide Changes"
                         } else {
-                            "Show Changes Since Last Commit"
+                            "Show Changes"
                         }))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.toggle_changes(&ToggleChanges, window, cx);
@@ -3701,6 +3725,78 @@ mod tests {
             })
             .unwrap();
         assert!(preview.read_with(cx, |preview, _| preview.changes.is_none()));
+    }
+
+    #[gpui::test]
+    async fn preview_changes_follow_the_project_diff_base(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                ".git": {},
+                "note.md": "Current.\n"
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/dir/.git").as_ref(),
+            &[("note.md", "Committed.\n".into())],
+        );
+        fs.set_merge_base_content_for_repo(
+            path!("/dir/.git").as_ref(),
+            &[("note.md", "Branch base.\n".into())],
+        );
+
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/dir/note.md"))],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let (preview, git_store) = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    let editor: Entity<Editor> = workspace
+                        .active_item(cx)
+                        .and_then(|item| item.act_as::<Editor>(cx))
+                        .unwrap();
+                    let preview =
+                        MarkdownPreviewView::create_markdown_view(workspace, editor, window, cx);
+                    workspace.active_pane().update(cx, |pane, cx| {
+                        pane.add_item(Box::new(preview.clone()), true, true, None, window, cx)
+                    });
+                    (preview, workspace.project().read(cx).git_store().clone())
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                preview.update(cx, |preview, cx| {
+                    preview.toggle_changes(&crate::ToggleChanges, window, cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let old_text = |cx: &mut TestAppContext| {
+            preview.read_with(cx, |preview, _| {
+                preview.changes.as_ref().unwrap().old_text.to_string()
+            })
+        };
+        assert_eq!(old_text(cx), "Committed.\n");
+
+        git_store.update(cx, |git_store, cx| {
+            git_store.set_diff_base_override(Some(settings::GitDiffBaseSetting::DefaultBranch), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(old_text(cx), "Branch base.\n");
     }
 
     #[gpui::test]

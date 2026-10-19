@@ -34,7 +34,8 @@ actions!(
         OpenFollowingPreview,
         /// Closes the markdown preview and returns focus to the source editor.
         CloseAndReturnToEditor,
-        /// Shows or hides the changes since the last commit in the markdown preview.
+        /// Shows or hides the changes of the file in the markdown preview, against the
+        /// same base as the git gutter.
         ToggleChanges
     ]
 );

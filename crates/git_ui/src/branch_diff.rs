@@ -95,12 +95,25 @@ impl BranchDiff {
             return;
         };
 
-        let default_branch = intended_repo.update(cx, |repo, _| repo.default_branch(true));
+        // The base of the branch's pull request, when it is known, wins over
+        // the default branch.
+        let branch_base_ref = project
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .branch_base_ref(intended_repo.read(cx).id)
+            .cloned();
+        let default_branch = branch_base_ref
+            .is_none()
+            .then(|| intended_repo.update(cx, |repo, _| repo.default_branch(true)));
         let workspace = cx.entity();
         let workspace_weak = workspace.downgrade();
         window
             .spawn(cx, async move |cx| {
-                let base_ref = default_branch.await??;
+                let base_ref = match default_branch {
+                    Some(default_branch) => default_branch.await??,
+                    None => branch_base_ref,
+                };
                 workspace.update_in(cx, |workspace, window, cx| {
                     let git_store = project.read(cx).git_store().clone();
                     let Some(base_ref) = base_ref else {

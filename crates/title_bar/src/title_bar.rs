@@ -2,11 +2,13 @@ mod application_menu;
 pub mod collab;
 mod onboarding_banner;
 mod plan_chip;
+mod pull_request;
 mod title_bar_settings;
 mod update_version;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
 use crate::plan_chip::PlanChip;
+use crate::pull_request::{BranchPullRequest, PullRequestState, branch_pull_request};
 use agent_settings::{AgentSettings, WindowLayout};
 use arrayvec::ArrayVec;
 use git_ui_core::worktree_picker::WorktreePicker;
@@ -28,9 +30,9 @@ use command_palette_hooks::CommandPaletteFilter;
 
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, Context, Element, Entity, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Subscription, TaskExt, WeakEntity, Window, actions, div,
-    pulsating_between,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions,
+    div, pulsating_between,
 };
 use onboarding_banner::OnboardingBanner;
 use project::{
@@ -38,12 +40,12 @@ use project::{
     trusted_worktrees::TrustedWorktrees,
 };
 use remote::RemoteConnectionOptions;
-use settings::{Settings as _, SettingsStore};
+use settings::{GitDiffBaseSetting, Settings as _, SettingsStore};
 
 use std::any::TypeId;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use theme::ActiveTheme;
 use title_bar_settings::TitleBarSettings;
 use ui::{
@@ -220,7 +222,22 @@ pub struct TitleBar {
     update_version: Entity<UpdateVersion>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
+    pull_request: Option<PullRequestLookup>,
+    _pull_request_task: Option<Task<()>>,
 }
+
+/// The pull request of the branch of the active repository.
+struct PullRequestLookup {
+    work_directory: Arc<Path>,
+    branch: SharedString,
+    fetched_at: Instant,
+    /// `None` while loading, or when no remote of the repository is on GitHub.
+    pull_request: Option<BranchPullRequest>,
+}
+
+/// How long the pull request of a branch is trusted before the window being
+/// activated again looks it up anew.
+const PULL_REQUEST_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -485,11 +502,13 @@ impl TitleBar {
 
         subscriptions.push(cx.observe(&active_call, |this, _, cx| this.active_call_changed(cx)));
         subscriptions.push(
-            cx.subscribe(&git_store, move |_, _, event, cx| match event {
+            cx.subscribe(&git_store, move |this, _, event, cx| match event {
                 GitStoreEvent::ActiveRepositoryChanged(_)
                 | GitStoreEvent::RepositoryUpdated(_, _, true) => {
+                    this.refresh_pull_request(false, cx);
                     cx.notify();
                 }
+                GitStoreEvent::DiffBaseChanged(_) => cx.notify(),
                 _ => {}
             }),
         );
@@ -505,6 +524,15 @@ impl TitleBar {
             ));
         }
         subscriptions.push(cx.observe_button_layout_changed(window, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            let is_stale = this
+                .pull_request
+                .as_ref()
+                .is_some_and(|lookup| lookup.fetched_at.elapsed() > PULL_REQUEST_REFRESH_INTERVAL);
+            if window.is_window_active() && is_stale {
+                this.refresh_pull_request(true, cx);
+            }
+        }));
         if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
             subscriptions.push(cx.subscribe(&trusted_worktrees, |_, _, _, cx| {
                 cx.notify();
@@ -535,9 +563,12 @@ impl TitleBar {
             update_version,
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
+            pull_request: None,
+            _pull_request_task: None,
         };
 
         this.observe_diagnostics(cx);
+        this.refresh_pull_request(false, cx);
 
         this
     }
@@ -1094,6 +1125,10 @@ impl TitleBar {
         if worktree_button.is_none() && branch_picker.is_none() {
             return None;
         }
+        let pull_request = branch_picker
+            .is_some()
+            .then(|| self.render_pull_request(cx))
+            .flatten();
 
         let show_separator = worktree_button.is_some() && branch_picker.is_some();
 
@@ -1110,6 +1145,171 @@ impl TitleBar {
                     )
                 })
                 .children(branch_picker)
+                .children(pull_request)
+                .into_any_element(),
+        )
+    }
+
+    /// Looks up the pull request of the active branch, unless it is already
+    /// known and `force` is false.
+    fn refresh_pull_request(&mut self, force: bool, cx: &mut Context<Self>) {
+        let project = self.project.read(cx);
+        let repository = project
+            .is_local()
+            .then(|| project.active_repository(cx))
+            .flatten();
+        let Some((repository_id, work_directory, branch)) = repository.and_then(|repository| {
+            let repository = repository.read(cx);
+            Some((
+                repository.id,
+                repository.work_directory_abs_path.clone(),
+                repository.branch.as_ref()?.name().to_string(),
+            ))
+        }) else {
+            self.pull_request = None;
+            self._pull_request_task = None;
+            return;
+        };
+        let branch = SharedString::from(branch);
+        let is_same_branch = self.pull_request.as_ref().is_some_and(|lookup| {
+            lookup.work_directory == work_directory && lookup.branch == branch
+        });
+        if is_same_branch && !force {
+            return;
+        }
+        if !is_same_branch {
+            self.pull_request = Some(PullRequestLookup {
+                work_directory: work_directory.clone(),
+                branch: branch.clone(),
+                fetched_at: Instant::now(),
+                pull_request: None,
+            });
+        }
+
+        let http_client = self.client.http_client();
+        let git_store = self.project.read(cx).git_store().clone();
+        self._pull_request_task = Some(cx.spawn(async move |this, cx| {
+            let pull_request = cx
+                .background_spawn({
+                    let work_directory = work_directory.clone();
+                    let branch = branch.clone();
+                    async move { branch_pull_request(&work_directory, &branch, http_client).await }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(lookup) = this.pull_request.as_mut().filter(|lookup| {
+                    lookup.work_directory == work_directory && lookup.branch == branch
+                }) else {
+                    return;
+                };
+                lookup.fetched_at = Instant::now();
+                let base_ref = match &pull_request {
+                    Some(BranchPullRequest::Found(pull_request)) => pull_request.base_ref.clone(),
+                    _ => None,
+                };
+                lookup.pull_request = pull_request;
+                git_store.update(cx, |git_store, cx| {
+                    git_store.set_branch_base_ref(repository_id, base_ref, cx);
+                });
+                cx.notify();
+            })
+            .log_err();
+        }));
+    }
+
+    /// The pull request of the branch, which also switches the project between
+    /// diffing against HEAD and against the base of the branch.
+    fn render_pull_request(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pull_request = self.pull_request.as_ref()?.pull_request.as_ref()?;
+        let git_store = self.project.read(cx).git_store().clone();
+        let shows_branch_changes =
+            git_store.read(cx).diff_base() == GitDiffBaseSetting::DefaultBranch;
+
+        let (label, color, title, url, base): (SharedString, Color, SharedString, _, SharedString) =
+            match pull_request {
+                BranchPullRequest::Found(pull_request) => (
+                    format!("#{}", pull_request.number).into(),
+                    match pull_request.state {
+                        PullRequestState::Open => Color::VersionControlAdded,
+                        PullRequestState::Draft => Color::Muted,
+                        PullRequestState::Merged => Color::Accent,
+                        PullRequestState::Closed => Color::Error,
+                    },
+                    format!("{} Pull Request", pull_request.state.label()).into(),
+                    Some(pull_request.url.clone()),
+                    pull_request
+                        .base_ref
+                        .clone()
+                        .unwrap_or_else(|| "the default branch".into()),
+                ),
+                BranchPullRequest::NotFound => (
+                    "No PR".into(),
+                    Color::Muted,
+                    "No Pull Request".into(),
+                    None,
+                    "the default branch".into(),
+                ),
+                BranchPullRequest::Unknown => (
+                    "PR?".into(),
+                    Color::Muted,
+                    "Pull Request Unknown: run `gh auth login`".into(),
+                    None,
+                    "the default branch".into(),
+                ),
+            };
+        // The state of the pull request only shows once it is the diff base,
+        // so the title bar stays quiet otherwise.
+        let color = if shows_branch_changes {
+            color
+        } else {
+            Color::Muted
+        };
+        let meta: SharedString = if shows_branch_changes {
+            format!("Showing the changes since {base}. Click to show the uncommitted changes.")
+                .into()
+        } else {
+            format!("Click to show the changes since {base}.").into()
+        };
+
+        Some(
+            h_flex()
+                .gap_px()
+                .child(
+                    Button::new("pull_request_diff_base", label)
+                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                        .toggle_state(shows_branch_changes)
+                        .label_size(LabelSize::Small)
+                        .color(color)
+                        .start_icon(
+                            Icon::new(IconName::PullRequest)
+                                .size(IconSize::XSmall)
+                                .color(color),
+                        )
+                        .tooltip(move |_window, cx| {
+                            Tooltip::with_meta(title.clone(), None, meta.clone(), cx)
+                        })
+                        .on_click(move |_, _, cx| {
+                            git_store.update(cx, |git_store, cx| {
+                                git_store.set_diff_base_override(
+                                    Some(if shows_branch_changes {
+                                        GitDiffBaseSetting::Head
+                                    } else {
+                                        GitDiffBaseSetting::DefaultBranch
+                                    }),
+                                    cx,
+                                );
+                            });
+                        }),
+                )
+                .when_some(url, |this, url| {
+                    this.child(
+                        IconButton::new("open_pull_request", IconName::ArrowUpRight)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Open Pull Request"))
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    )
+                })
                 .into_any_element(),
         )
     }

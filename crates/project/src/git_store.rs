@@ -107,7 +107,13 @@ pub struct GitStore {
     worktree_store: Entity<WorktreeStore>,
     repositories: HashMap<RepositoryId, Entity<Repository>>,
     parked_repositories: Vec<ParkedRepository>,
+    /// The diff base in use: `diff_base_override` when set, else the setting.
     diff_base: GitDiffBaseSetting,
+    diff_base_setting: GitDiffBaseSetting,
+    diff_base_override: Option<GitDiffBaseSetting>,
+    /// Refs that replace the default branch as the base of a repository's
+    /// branch, like the base branch of its pull request.
+    branch_base_refs: HashMap<RepositoryId, SharedString>,
     display_diffs: HashMap<RepositoryId, DisplayDiff>,
     worktree_ids: HashMap<RepositoryId, HashSet<WorktreeId>>,
     active_repo_id: Option<RepositoryId>,
@@ -1009,9 +1015,15 @@ impl GitStore {
         }
 
         _subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
-            let setting = ProjectSettings::get_global(cx).git.diff_base;
-            if setting != this.diff_base {
-                this.set_diff_base(setting, cx);
+            let diff_base_setting = ProjectSettings::get_global(cx).git.diff_base;
+            // Changing the setting takes over from the project's override.
+            if diff_base_setting != this.diff_base_setting {
+                this.diff_base_setting = diff_base_setting;
+                this.diff_base_override = None;
+            }
+            let diff_base = this.diff_base_override.unwrap_or(this.diff_base_setting);
+            if diff_base != this.diff_base {
+                this.set_diff_base(diff_base, cx);
             }
             this.activate_parked_repositories_where_parking_disabled(cx);
         }));
@@ -1025,6 +1037,9 @@ impl GitStore {
             repositories: HashMap::default(),
             parked_repositories: Vec::new(),
             diff_base: diff_base_setting,
+            diff_base_setting,
+            diff_base_override: None,
+            branch_base_refs: HashMap::default(),
             display_diffs: HashMap::default(),
             worktree_ids: HashMap::default(),
             active_repo_id: None,
@@ -5119,6 +5134,40 @@ impl GitStore {
         self.diff_base
     }
 
+    /// Overrides the `git.diff_base` setting for this project, or follows it
+    /// again with `None`.
+    pub fn set_diff_base_override(
+        &mut self,
+        diff_base_override: Option<GitDiffBaseSetting>,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff_base_override = diff_base_override;
+        self.set_diff_base(diff_base_override.unwrap_or(self.diff_base_setting), cx);
+    }
+
+    /// Makes `base_ref` the base of the repository's branch instead of the
+    /// default branch, or goes back to the default branch with `None`.
+    pub fn set_branch_base_ref(
+        &mut self,
+        repo_id: RepositoryId,
+        base_ref: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = match base_ref {
+            Some(base_ref) => {
+                self.branch_base_refs.insert(repo_id, base_ref.clone()) != Some(base_ref)
+            }
+            None => self.branch_base_refs.remove(&repo_id).is_some(),
+        };
+        if changed {
+            self.refresh_diff_base_for_repo(repo_id, cx);
+        }
+    }
+
+    pub fn branch_base_ref(&self, repo_id: RepositoryId) -> Option<&SharedString> {
+        self.branch_base_refs.get(&repo_id)
+    }
+
     fn set_diff_base(&mut self, setting: GitDiffBaseSetting, cx: &mut Context<Self>) {
         if self.diff_base == setting {
             return;
@@ -5232,9 +5281,12 @@ impl GitStore {
             return;
         };
 
+        let branch_base_ref = self.branch_base_refs.get(&repo_id).cloned();
         let task = cx.spawn(async move |this, cx| {
-            let result: Result<Option<SharedString>> =
-                async { repo.update(cx, |repo, _| repo.default_branch(true)).await? }.await;
+            let result: Result<Option<SharedString>> = match branch_base_ref {
+                Some(branch_base_ref) => Ok(Some(branch_base_ref)),
+                None => async { repo.update(cx, |repo, _| repo.default_branch(true)).await? }.await,
+            };
             this.update(cx, |this, cx| {
                 let Some(state) = this.display_diffs.get_mut(&repo_id) else {
                     return;
@@ -11883,6 +11935,111 @@ mod tests {
                 "regular file should have a git diff base"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_diff_base_override_and_branch_base_ref(cx: &mut TestAppContext) {
+        use util::{path, rel_path::rel_path};
+
+        init_test(cx);
+
+        let project_root = Path::new(path!("/project"));
+        let dot_git = project_root.join(".git");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            project_root,
+            json!({
+                ".git": {},
+                "committed.txt": "base\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(&dot_git, &[("committed.txt", "head\n".into())]);
+        fs.set_merge_base_content_for_repo(&dot_git, &[("committed.txt", "base\n".into())]);
+
+        let project = Project::test(fs.clone(), [project_root], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("committed.txt")), cx)
+            })
+            .await
+            .unwrap();
+        let repo_id = git_store.read_with(cx, |git_store, cx| {
+            *git_store.repo_snapshots(cx).keys().next().unwrap()
+        });
+        async fn display_base_text(
+            git_store: &Entity<GitStore>,
+            buffer: &Entity<Buffer>,
+            cx: &mut TestAppContext,
+        ) -> Option<String> {
+            let diff = git_store
+                .update(cx, |git_store, cx| {
+                    git_store.open_display_diff(buffer.clone(), cx)
+                })
+                .await
+                .unwrap();
+            diff.read_with(cx, |diff, cx| diff.base_text_string(cx))
+        }
+
+        git_store.update(cx, |git_store, cx| {
+            git_store.set_branch_base_ref(repo_id, Some("origin/develop".into()), cx);
+            git_store.set_diff_base_override(Some(settings::GitDiffBaseSetting::DefaultBranch), cx);
+        });
+        cx.run_until_parked();
+        git_store.read_with(cx, |git_store, cx| {
+            assert_eq!(
+                git_store.diff_base(),
+                settings::GitDiffBaseSetting::DefaultBranch
+            );
+            assert_eq!(
+                git_store
+                    .display_diff_for_repo(repo_id)
+                    .unwrap()
+                    .read(cx)
+                    .diff_base(),
+                &diff_buffer_list::DiffBase::Merge {
+                    base_ref: "origin/develop".into()
+                }
+            );
+        });
+        assert_eq!(
+            display_base_text(&git_store, &buffer, cx).await.as_deref(),
+            Some("base\n")
+        );
+
+        git_store.update(cx, |git_store, cx| {
+            git_store.set_diff_base_override(Some(settings::GitDiffBaseSetting::Head), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            display_base_text(&git_store, &buffer, cx).await.as_deref(),
+            Some("head\n")
+        );
+
+        // Without an override, the setting applies again.
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.git.get_or_insert_default().diff_base =
+                        Some(settings::GitDiffBaseSetting::DefaultBranch);
+                });
+            });
+        });
+        git_store.update(cx, |git_store, cx| {
+            git_store.set_diff_base_override(None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            display_base_text(&git_store, &buffer, cx).await.as_deref(),
+            Some("base\n")
+        );
     }
 
     #[gpui::test]

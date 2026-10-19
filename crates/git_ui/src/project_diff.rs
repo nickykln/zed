@@ -48,7 +48,8 @@ actions!(
         Diff,
         /// Shows working changes relative to HEAD.
         DiffHead,
-        /// Toggles the git diff base between HEAD and the default branch.
+        /// Toggles the git diff base of the project between HEAD and the base
+        /// of the branch: its pull request's base, or the default branch.
         ToggleDiffBase,
         /// Adds files to the git staging area.
         Add,
@@ -81,17 +82,14 @@ impl ProjectDiff {
             Self::deploy_at(workspace, None, window, cx);
         });
         workspace.register_action(|workspace, _: &ToggleDiffBase, _window, cx| {
-            settings::update_settings_file(
-                workspace.app_state().fs.clone(),
-                cx,
-                move |settings, _| {
-                    let git = settings.git.get_or_insert_default();
-                    git.diff_base = Some(match git.diff_base.unwrap_or_default() {
-                        GitDiffBaseSetting::Head => GitDiffBaseSetting::DefaultBranch,
-                        GitDiffBaseSetting::DefaultBranch => GitDiffBaseSetting::Head,
-                    });
-                },
-            );
+            let git_store = workspace.project().read(cx).git_store().clone();
+            git_store.update(cx, |git_store, cx| {
+                let diff_base = match git_store.diff_base() {
+                    GitDiffBaseSetting::Head => GitDiffBaseSetting::DefaultBranch,
+                    GitDiffBaseSetting::DefaultBranch => GitDiffBaseSetting::Head,
+                };
+                git_store.set_diff_base_override(Some(diff_base), cx);
+            });
         });
         workspace.register_action(
             |workspace, _: &git_actions::ViewUncommittedChanges, window, cx| {
@@ -1093,6 +1091,61 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_branch_diff_uses_the_branch_base_ref(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "committed.txt": "head\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("committed.txt", "head\n".into())],
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("committed.txt", "base\n".into())],
+        );
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.focus(&workspace);
+
+        project.update(cx, |project, cx| {
+            let repository_id = project.active_repository(cx).unwrap().read(cx).id;
+            project.git_store().update(cx, |git_store, cx| {
+                git_store.set_branch_base_ref(repository_id, Some("origin/develop".into()), cx);
+                git_store.set_diff_base_override(Some(GitDiffBaseSetting::DefaultBranch), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            window.dispatch_action(Diff.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, cx| {
+            let branch_diff = workspace.active_item_as::<BranchDiff>(cx).unwrap();
+            assert_eq!(
+                branch_diff.read(cx).diff_base(cx),
+                &DiffBase::Merge {
+                    base_ref: "origin/develop".into()
+                }
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_diff_action_follows_diff_base_setting(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -1147,7 +1200,7 @@ mod tests {
         project.read_with(cx, |project, cx| {
             assert_eq!(
                 project.git_store().read(cx).diff_base(),
-                GitDiffBaseSetting::DefaultBranch
+                GitDiffBaseSetting::Head
             );
         });
 
@@ -1158,14 +1211,9 @@ mod tests {
         project.read_with(cx, |project, cx| {
             assert_eq!(
                 project.git_store().read(cx).diff_base(),
-                GitDiffBaseSetting::Head
+                GitDiffBaseSetting::DefaultBranch
             );
         });
-
-        cx.update(|window, cx| {
-            window.dispatch_action(ToggleDiffBase.boxed_clone(), cx);
-        });
-        cx.run_until_parked();
 
         cx.update(|window, cx| {
             window.dispatch_action(Diff.boxed_clone(), cx);
