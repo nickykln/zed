@@ -86,6 +86,9 @@ use crate::thread_switcher::{
 #[cfg(test)]
 mod sidebar_tests;
 
+const TERMINAL_PANEL_LOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const TERMINAL_PANEL_LOAD_ATTEMPTS: usize = 100;
+
 gpui::actions!(
     agents_sidebar,
     [
@@ -750,7 +753,6 @@ enum DefaultBranchCache {
 /// What a new session started from the sidebar runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NewSessionAgent {
-    ZedAgent,
     Terminal,
     Cli(agent_ui::CliAgent),
 }
@@ -758,7 +760,6 @@ enum NewSessionAgent {
 impl NewSessionAgent {
     fn name(self) -> &'static str {
         match self {
-            NewSessionAgent::ZedAgent => "Zed Agent",
             NewSessionAgent::Terminal => "Terminal",
             NewSessionAgent::Cli(agent) => agent.name(),
         }
@@ -766,7 +767,6 @@ impl NewSessionAgent {
 
     fn icon(self) -> IconName {
         match self {
-            NewSessionAgent::ZedAgent => IconName::ZedAgent,
             NewSessionAgent::Terminal => IconName::Terminal,
             NewSessionAgent::Cli(agent) => agent.icon(),
         }
@@ -928,6 +928,11 @@ impl Sidebar {
         )
         .detach();
 
+        cx.observe_global::<agent_ui::CliSessions>(|this, cx| {
+            this.schedule_update_entries(false, cx);
+        })
+        .detach();
+
         let channels_with_threads = channels_with_threads(cx);
         cx.spawn(async move |this, cx| {
             let channels = channels_with_threads.await;
@@ -1073,8 +1078,8 @@ impl Sidebar {
         cx.subscribe_in(
             workspace,
             window,
-            move |this, workspace, event: &workspace::Event, window, cx| {
-                if let workspace::Event::PanelAdded(view) = event {
+            move |this, workspace, event: &workspace::Event, window, cx| match event {
+                workspace::Event::PanelAdded(view) => {
                     if let Ok(agent_panel) = view.clone().downcast::<AgentPanel>() {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
                         this.schedule_update_entries(false, cx);
@@ -1083,6 +1088,16 @@ impl Sidebar {
                         this.subscribe_to_terminal_panel(workspace, &terminal_panel, window, cx);
                     }
                 }
+                // Agent CLI terminals can also be moved to the editor panes.
+                workspace::Event::ActiveItemChanged => {
+                    if AgentSettings::get_global(cx).use_cli
+                        && let Some(session_id) =
+                            agent_ui::session_id_for_pane(workspace.read(cx).active_pane(), cx)
+                    {
+                        this.select_cli_session(workspace, session_id, cx);
+                    }
+                }
+                _ => {}
             },
         )
         .detach();
@@ -1110,8 +1125,11 @@ impl Sidebar {
             window,
             move |this, _, event: &agent_ui::TerminalPanelEvent, _window, cx| match event {
                 agent_ui::TerminalPanelEvent::TaskTerminalActivated { label } => {
-                    if let Some(workspace) = workspace.upgrade() {
-                        this.sync_active_entry_from_terminal_tab(&workspace, label, cx);
+                    if let Some(workspace) = workspace.upgrade()
+                        && AgentSettings::get_global(cx).use_cli
+                        && let Some(session_id) = agent_ui::session_id_for_terminal_label(label, cx)
+                    {
+                        this.select_cli_session(&workspace, session_id, cx);
                     }
                 }
             },
@@ -1119,35 +1137,55 @@ impl Sidebar {
         .detach();
     }
 
-    /// Selects the thread whose CLI session runs in the activated terminal tab.
-    fn sync_active_entry_from_terminal_tab(
+    /// Selects the thread of the CLI session shown in a terminal tab.
+    fn select_cli_session(
         &mut self,
         workspace: &Entity<Workspace>,
-        label: &str,
+        session_id: acp::SessionId,
         cx: &mut Context<Self>,
     ) {
-        if !AgentSettings::get_global(cx).use_cli {
-            return;
-        }
-        let Some(session_id) = agent_ui::session_id_for_terminal_label(label, cx) else {
-            return;
-        };
         if self.active_workspace(cx).as_ref() != Some(workspace) {
             return;
         }
+        if self.set_active_cli_session(workspace, session_id, cx) {
+            self.schedule_update_entries(false, cx);
+        }
+    }
+
+    fn set_active_cli_session(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        session_id: acp::SessionId,
+        cx: &App,
+    ) -> bool {
         let Some(thread_id) = ThreadMetadataStore::global(cx)
             .read(cx)
             .entry_by_session(&session_id)
             .map(|metadata| metadata.thread_id)
         else {
-            return;
+            return false;
         };
         self.active_entry = Some(ActiveEntry::Thread {
             thread_id,
             session_id: Some(session_id),
             workspace: workspace.clone(),
         });
-        self.schedule_update_entries(false, cx);
+        true
+    }
+
+    /// Session of the agent CLI shown in the workspace while the agent panel
+    /// is hidden: in the active tab of the terminal panel, or else in the
+    /// active editor pane.
+    fn shown_cli_session(workspace: &Entity<Workspace>, cx: &App) -> Option<acp::SessionId> {
+        if !AgentSettings::get_global(cx).use_cli || AgentPanel::is_visible(workspace, cx) {
+            return None;
+        }
+        workspace
+            .read(cx)
+            .panel::<agent_ui::TerminalPanel>(cx)
+            .and_then(|terminal_panel| terminal_panel.read(cx).active_task_label(cx))
+            .and_then(|label| agent_ui::session_id_for_terminal_label(&label, cx))
+            .or_else(|| agent_ui::session_id_for_pane(workspace.read(cx).active_pane(), cx))
     }
 
     fn move_entry_paths(
@@ -1246,6 +1284,12 @@ impl Sidebar {
     }
 
     fn sync_active_entry_from_active_workspace(&mut self, cx: &App) {
+        if let Some(workspace) = self.active_workspace(cx)
+            && let Some(session_id) = Self::shown_cli_session(&workspace, cx)
+            && self.set_active_cli_session(&workspace, session_id, cx)
+        {
+            return;
+        }
         let panel = self
             .active_workspace(cx)
             .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx));
@@ -1259,6 +1303,10 @@ impl Sidebar {
     /// case, create a fresh draft so the panel has valid content and
     /// `active_entry` can point at it.
     fn replace_archived_panel_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The agent panel stays closed with agent CLIs.
+        if AgentSettings::get_global(cx).use_cli {
+            return;
+        }
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
@@ -1294,6 +1342,12 @@ impl Sidebar {
             .panel::<AgentPanel>(cx)
             .is_some_and(|p| p == *agent_panel);
         if !is_active_panel {
+            return false;
+        }
+
+        // The hidden agent panel still holds a thread, which must not take the
+        // selection from the agent CLI session shown in a terminal.
+        if Self::shown_cli_session(&active_workspace, cx).is_some() {
             return false;
         }
 
@@ -1807,7 +1861,12 @@ impl Sidebar {
                         thread.draft = Some(kind);
                     }
                 }
-                threads.retain(|thread| thread.draft.is_none() || thread.metadata.title.is_some());
+                // Agent CLI sessions are started from the `+` button only, so
+                // the drafts of the closed agent panel are left out.
+                let use_cli = AgentSettings::get_global(cx).use_cli;
+                threads.retain(|thread| {
+                    thread.draft.is_none() || (!use_cli && thread.metadata.title.is_some())
+                });
 
                 // Keep empty drafts only while their thread is active; preserve
                 // drafts with content because they hold user-typed state.
@@ -1848,6 +1907,17 @@ impl Sidebar {
                             let status = info.status;
                             let thread_id = thread.metadata.thread_id;
                             Arc::make_mut(thread).apply_active_info(info);
+                            new_live_statuses.insert(session_id, (status, thread_id));
+                        } else if let Some(status) = agent_ui::session_status(&session_id, cx) {
+                            match status {
+                                AgentThreadStatus::Running => has_running_threads = true,
+                                AgentThreadStatus::WaitingForConfirmation => {
+                                    waiting_thread_count += 1
+                                }
+                                AgentThreadStatus::Completed | AgentThreadStatus::Error => {}
+                            }
+                            let thread_id = thread.metadata.thread_id;
+                            Arc::make_mut(thread).status = status;
                             new_live_statuses.insert(session_id, (status, thread_id));
                         }
                     }
@@ -2738,7 +2808,6 @@ impl Sidebar {
                                             })
                                     };
                                     submenu = submenu
-                                        .item(agent_entry(NewSessionAgent::ZedAgent))
                                         .item(agent_entry(NewSessionAgent::Terminal))
                                         .separator()
                                         .header("External Agents")
@@ -4231,7 +4300,7 @@ impl Sidebar {
                     multi_workspace.activate(workspace.clone(), None, window, cx);
                 });
             }
-            return agent_ui::open_thread_in_terminal_panel(
+            let opened = agent_ui::open_thread_in_terminal_panel(
                 workspace,
                 &metadata.agent_id,
                 session_id,
@@ -4239,6 +4308,18 @@ impl Sidebar {
                 window,
                 cx,
             );
+            if opened {
+                // Selected right away: a resumed session's terminal only
+                // shows up once its task has spawned.
+                self.active_entry = Some(ActiveEntry::Thread {
+                    thread_id: metadata.thread_id,
+                    session_id: metadata.session_id.clone(),
+                    workspace: workspace.clone(),
+                });
+                self.record_thread_access(&metadata.thread_id);
+                self.update_entries(cx);
+            }
+            return opened;
         }
 
         let Some((target_window, workspace)) =
@@ -7263,22 +7344,50 @@ impl Sidebar {
         }
         match self.new_session_agent {
             NewSessionAgent::Cli(agent) => {
-                if agent_ui::open_new_thread_in_terminal_panel(
-                    workspace,
-                    agent,
-                    workspace_path_list(workspace, cx),
-                    window,
-                    cx,
-                ) {
-                    return;
-                }
-                self.create_new_thread(workspace, None, window, cx);
-            }
-            NewSessionAgent::ZedAgent => {
-                self.create_new_thread(workspace, Some(agent_ui::Agent::NativeAgent), window, cx);
+                self.when_terminal_panel_loaded(workspace, window, cx, move |workspace, window, cx| {
+                    agent_ui::open_new_thread_in_terminal_panel(
+                        workspace,
+                        agent,
+                        workspace_path_list(workspace, cx),
+                        window,
+                        cx,
+                    );
+                });
             }
             NewSessionAgent::Terminal => self.create_new_terminal(workspace, window, cx),
         }
+    }
+
+    /// Runs `callback` once the workspace has its terminal panel. A workspace
+    /// that was just opened loads its panels in the background, and falling
+    /// back to the agent panel meanwhile would show it.
+    fn when_terminal_panel_loaded(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        callback: impl FnOnce(&Entity<Workspace>, &mut Window, &mut App) + 'static,
+    ) {
+        if workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx).is_some() {
+            callback(workspace, window, cx);
+            return;
+        }
+        let workspace = workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            for _ in 0..TERMINAL_PANEL_LOAD_ATTEMPTS {
+                cx.background_executor()
+                    .timer(TERMINAL_PANEL_LOAD_INTERVAL)
+                    .await;
+                let loaded = workspace.read_with(cx, |workspace, cx| {
+                    workspace.panel::<agent_ui::TerminalPanel>(cx).is_some()
+                });
+                if loaded {
+                    return cx.update(|window, cx| callback(&workspace, window, cx));
+                }
+            }
+            anyhow::bail!("the terminal panel of the workspace did not load")
+        })
+        .detach_and_log_err(cx);
     }
 
     fn should_create_terminal_for_workspace(
@@ -7398,6 +7507,19 @@ impl Sidebar {
         multi_workspace.update(cx, |multi_workspace, cx| {
             multi_workspace.activate(workspace.clone(), None, window, cx);
         });
+
+        if AgentSettings::get_global(cx).use_cli {
+            let working_directory = workspace_path_list(workspace, cx).paths().first().cloned();
+            self.when_terminal_panel_loaded(workspace, window, cx, move |workspace, window, cx| {
+                if let Some(terminal_panel) = workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx)
+                {
+                    terminal_panel.update(cx, |terminal_panel, cx| {
+                        terminal_panel.open_shell_terminal(working_directory, window, cx);
+                    });
+                }
+            });
+            return;
+        }
 
         workspace.update(cx, |workspace, cx| {
             if let Some(panel) = workspace.panel::<AgentPanel>(cx) {

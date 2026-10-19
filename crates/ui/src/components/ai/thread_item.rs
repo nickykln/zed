@@ -319,7 +319,7 @@ impl RenderOnce for ThreadItem {
         } else if self.status == AgentThreadStatus::WaitingForConfirmation {
             Some(
                 Icon::new(IconName::Warning)
-                    .size(IconSize::XSmall)
+                    .size(IconSize::Small)
                     .color(Color::Warning),
             )
         } else if self.notified {

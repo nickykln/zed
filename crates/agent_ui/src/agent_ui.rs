@@ -81,8 +81,8 @@ pub use crate::agent_panel::{
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::cli_session::{
-    CliAgent, open_new_thread_in_terminal_panel, open_thread_in_terminal_panel, rename_session,
-    session_id_for_terminal_label,
+    CliAgent, CliSessions, open_new_thread_in_terminal_panel, open_thread_in_terminal_panel,
+    rename_session, session_id_for_pane, session_id_for_terminal_label, session_status,
 };
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;

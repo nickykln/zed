@@ -8933,7 +8933,11 @@ pub(crate) mod tests {
 
     pub(crate) fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
+            let mut settings_store = SettingsStore::test(cx);
+            // Tests cover the agent panel, which `use_cli` keeps closed.
+            settings_store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().use_cli = Some(false);
+            });
             cx.set_global(settings_store);
             // Use an isolated DB so parallel tests can't overwrite each
             // other's global keys (e.g. the last-created entry kind).

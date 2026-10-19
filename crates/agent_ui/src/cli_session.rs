@@ -2,19 +2,23 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v2 as acp_v2;
+use anyhow::Result;
 use collections::{HashMap, HashSet};
 use gpui::{App, Entity, Global, TaskExt as _, Window};
 use project::AgentId;
 use task::{HideStrategy, RevealStrategy, RevealTarget, Shell, SpawnInTerminal, TaskId};
-use terminal_view::terminal_panel::TerminalPanel;
+use terminal_view::terminal_panel::{self, TerminalPanel};
+use ui::AgentThreadStatus;
 use util::ResultExt as _;
-use workspace::{PathList, Workspace};
+use workspace::{Pane, PathList, Workspace};
 
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const ENTER_DELAY: Duration = Duration::from_millis(500);
 const CODEX_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const TERMINAL_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Agents that ship a command line client which can run in the terminal panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +167,33 @@ impl CliAgent {
         }
     }
 
+    /// Arguments that make the session report its status through hooks, and
+    /// starts polling that status. Only Claude has hooks for every state.
+    fn status_arguments(
+        self,
+        session_id: &acp_v2::SessionId,
+        terminal_labels: &[String],
+        terminal_panel: &Entity<TerminalPanel>,
+        cx: &mut App,
+    ) -> Vec<String> {
+        if self != CliAgent::Claude {
+            return Vec::new();
+        }
+        let Some(settings_file) = write_claude_status_settings(session_id).log_err() else {
+            return Vec::new();
+        };
+        watch_session_status(
+            session_id.clone(),
+            terminal_labels.to_vec(),
+            terminal_panel.downgrade(),
+            cx,
+        );
+        vec![
+            "--settings".into(),
+            settings_file.to_string_lossy().into_owned(),
+        ]
+    }
+
     fn read_title(self, title_file: &Path, session_id: &acp_v2::SessionId) -> Option<String> {
         match self {
             CliAgent::Claude => read_claude_title(title_file),
@@ -224,22 +255,42 @@ fn read_codex_title(session_index: &Path, session_id: &acp_v2::SessionId) -> Opt
     title
 }
 
-/// Book-keeping shared by every terminal session.
+/// Book-keeping shared by every terminal session. Observers of this global are
+/// notified when the status of a session changes.
 #[derive(Default)]
-struct CliSessions {
+pub struct CliSessions {
     /// Threads whose title is already being polled.
     watched_threads: HashSet<ThreadId>,
     /// Labels of terminals started before their session had an id. Such a
     /// terminal can't be labelled after its session's resume command.
     started_terminal_labels: HashMap<acp_v2::SessionId, String>,
+    /// Sessions whose status file is being polled.
+    watched_statuses: HashSet<acp_v2::SessionId>,
+    /// Latest status reported by the hooks of each running session.
+    statuses: HashMap<acp_v2::SessionId, AgentThreadStatus>,
 }
 
 impl Global for CliSessions {}
 
+/// Status of the session running in a terminal, as reported by its hooks.
+pub fn session_status(session_id: &acp_v2::SessionId, cx: &App) -> Option<AgentThreadStatus> {
+    cx.try_global::<CliSessions>()?
+        .statuses
+        .get(session_id)
+        .copied()
+}
+
+/// Session run by the terminal shown in the active tab of `pane`.
+pub fn session_id_for_pane(pane: &Entity<Pane>, cx: &App) -> Option<acp_v2::SessionId> {
+    session_id_for_terminal_label(&terminal_panel::active_task_label(pane, cx)?, cx)
+}
+
 /// Maps the label of a terminal tab back to the session it runs.
 pub fn session_id_for_terminal_label(label: &str, cx: &App) -> Option<acp_v2::SessionId> {
     for agent in [CliAgent::Claude, CliAgent::Codex] {
-        let prefix = format!("{} ", agent.resume_label(&acp_v2::SessionId::new("")));
+        // The resume label of an empty session id is the command followed by
+        // its arguments and a trailing space.
+        let prefix = agent.resume_label(&acp_v2::SessionId::new(""));
         if let Some(session_id) = label.strip_prefix(&prefix) {
             return Some(acp_v2::SessionId::new(session_id));
         }
@@ -379,11 +430,22 @@ pub fn open_thread_in_terminal_panel(
             );
         }
     }
+    let mut arguments = agent.start_arguments(session_id, working_directory.as_deref());
+    // Writing the status settings resets the status of the session, so it is
+    // skipped when its terminal is only focused again.
+    let already_running = terminal_panel.update(cx, |terminal_panel, cx| {
+        reusable_labels
+            .iter()
+            .any(|label| terminal_panel.has_running_task_terminal(label, cx))
+    });
+    if !already_running {
+        arguments.extend(agent.status_arguments(session_id, &reusable_labels, &terminal_panel, cx));
+    }
     spawn_in_terminal_panel(
         workspace,
         &terminal_panel,
         agent.command(),
-        agent.start_arguments(session_id, working_directory.as_deref()),
+        arguments,
         agent.resume_label(session_id),
         Some(session_id),
         working_directory,
@@ -425,11 +487,18 @@ pub fn open_new_thread_in_terminal_panel(
                     cx,
                 );
             }
+            let mut arguments = vec!["--session-id".into(), session_id.to_string()];
+            arguments.extend(agent.status_arguments(
+                &session_id,
+                std::slice::from_ref(&resume_label),
+                &terminal_panel,
+                cx,
+            ));
             spawn_in_terminal_panel(
                 workspace,
                 &terminal_panel,
                 agent.command(),
-                vec!["--session-id".into(), session_id.to_string()],
+                arguments,
                 resume_label,
                 Some(&session_id),
                 working_directory,
@@ -685,6 +754,164 @@ fn find_new_codex_session(
     None
 }
 
+/// Directory of the files through which sessions report their status. The
+/// path of the settings file is passed unquoted to the shell, so it must not
+/// contain spaces, which rules out the application support directory.
+fn status_directory() -> PathBuf {
+    std::env::temp_dir().join("zed-agent-cli")
+}
+
+fn status_file(session_id: &acp_v2::SessionId) -> PathBuf {
+    status_directory().join(format!("{session_id}.status.json"))
+}
+
+/// Writes Claude settings whose hooks copy each hook input to the session's
+/// status file, and returns their path. A stale status file is removed, so
+/// the new session starts out as idle.
+fn write_claude_status_settings(session_id: &acp_v2::SessionId) -> Result<PathBuf> {
+    let directory = status_directory();
+    std::fs::create_dir_all(&directory)?;
+    let status_file = status_file(session_id);
+    if let Err(error) = std::fs::remove_file(&status_file)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    let quoted_status_file = format!(
+        "'{}'",
+        status_file.to_string_lossy().replace('\'', "'\\''")
+    );
+    let hook = serde_json::json!([{
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": format!("cat > {quoted_status_file}") }],
+    }]);
+    let settings = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": hook,
+            "PreToolUse": hook,
+            "PostToolUse": hook,
+            "Notification": hook,
+            "Stop": hook,
+        }
+    });
+    let settings_file = directory.join(format!("{session_id}.settings.json"));
+    std::fs::write(&settings_file, serde_json::to_vec(&settings)?)?;
+    Ok(settings_file)
+}
+
+/// Maps the input of the last hook Claude ran to the session's status. `None`
+/// means the hook says nothing about it, like the reminder sent when Claude
+/// has been idle for a while.
+fn status_from_hook_input(hook_input: &serde_json::Value) -> Option<AgentThreadStatus> {
+    let field = |key: &str| hook_input.get(key).and_then(|value| value.as_str());
+    match field("hook_event_name")? {
+        "UserPromptSubmit" | "PostToolUse" => Some(AgentThreadStatus::Running),
+        "PreToolUse" => match field("tool_name") {
+            Some("AskUserQuestion" | "ExitPlanMode") => {
+                Some(AgentThreadStatus::WaitingForConfirmation)
+            }
+            _ => Some(AgentThreadStatus::Running),
+        },
+        "Notification" => {
+            let asks_the_user = match field("notification_type") {
+                Some(notification_type) => {
+                    matches!(notification_type, "permission_prompt" | "elicitation_dialog")
+                }
+                // Older versions don't send a type, only the message.
+                None => field("message").is_some_and(|message| message.contains("permission")),
+            };
+            asks_the_user.then_some(AgentThreadStatus::WaitingForConfirmation)
+        }
+        "Stop" => Some(AgentThreadStatus::Completed),
+        _ => None,
+    }
+}
+
+/// Polls the status file of a session until its terminal stops running.
+fn watch_session_status(
+    session_id: acp_v2::SessionId,
+    terminal_labels: Vec<String>,
+    terminal_panel: gpui::WeakEntity<TerminalPanel>,
+    cx: &mut App,
+) {
+    if !cx
+        .default_global::<CliSessions>()
+        .watched_statuses
+        .insert(session_id.clone())
+    {
+        return;
+    }
+    let status_file = status_file(&session_id);
+    let started_at = SystemTime::now();
+    cx.spawn(async move |cx| {
+        let mut terminal_was_running = false;
+        let mut last_modified = None;
+        loop {
+            cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
+
+            let terminal_is_running = cx.update(|cx| {
+                terminal_panel
+                    .update(cx, |terminal_panel, cx| {
+                        terminal_labels
+                            .iter()
+                            .any(|label| terminal_panel.has_running_task_terminal(label, cx))
+                    })
+                    .unwrap_or(false)
+            });
+            if terminal_is_running {
+                terminal_was_running = true;
+            } else if terminal_was_running
+                || started_at.elapsed().unwrap_or_default() > TERMINAL_START_TIMEOUT
+            {
+                break;
+            }
+
+            let (modified, hook_input) = cx
+                .background_executor()
+                .spawn({
+                    let status_file = status_file.clone();
+                    async move {
+                        let modified = std::fs::metadata(&status_file)
+                            .and_then(|metadata| metadata.modified())
+                            .ok();
+                        let hook_input = modified
+                            .and_then(|_| std::fs::read(&status_file).ok())
+                            .and_then(|contents| {
+                                serde_json::from_slice::<serde_json::Value>(&contents).ok()
+                            });
+                        (modified, hook_input)
+                    }
+                })
+                .await;
+            if modified.is_none() || modified == last_modified {
+                continue;
+            }
+            // A hook may still be writing the file. It is read again on the
+            // next poll, even if its modification time stays the same.
+            let Some(hook_input) = hook_input else {
+                continue;
+            };
+            last_modified = modified;
+            let Some(status) = status_from_hook_input(&hook_input) else {
+                continue;
+            };
+            cx.update(|cx| {
+                if session_status(&session_id, cx) != Some(status) {
+                    cx.default_global::<CliSessions>()
+                        .statuses
+                        .insert(session_id.clone(), status);
+                }
+            });
+        }
+        cx.update(|cx| {
+            let sessions = cx.default_global::<CliSessions>();
+            sessions.watched_statuses.remove(&session_id);
+            sessions.statuses.remove(&session_id);
+        });
+    })
+    .detach();
+}
+
 fn spawn_in_terminal_panel(
     workspace: &Entity<Workspace>,
     terminal_panel: &Entity<TerminalPanel>,
@@ -740,4 +967,69 @@ fn spawn_in_terminal_panel(
         })
         .detach_and_log_err(cx);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn test_session_id_for_terminal_label(cx: &mut TestAppContext) {
+        let session_id = acp_v2::SessionId::new("0b5f6c1e-7d3a-4c39-9a7e-2f1d8e6b4a90");
+        cx.update(|cx| {
+            for agent in [CliAgent::Claude, CliAgent::Codex] {
+                assert_eq!(
+                    session_id_for_terminal_label(&agent.resume_label(&session_id), cx),
+                    Some(session_id.clone())
+                );
+            }
+            assert_eq!(session_id_for_terminal_label("claude", cx), None);
+        });
+    }
+
+    #[test]
+    fn test_status_from_hook_input() {
+        let status = |hook_input: serde_json::Value| status_from_hook_input(&hook_input);
+        assert_eq!(
+            status(serde_json::json!({ "hook_event_name": "UserPromptSubmit" })),
+            Some(AgentThreadStatus::Running)
+        );
+        assert_eq!(
+            status(serde_json::json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash" })),
+            Some(AgentThreadStatus::Running)
+        );
+        assert_eq!(
+            status(serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "AskUserQuestion",
+            })),
+            Some(AgentThreadStatus::WaitingForConfirmation)
+        );
+        assert_eq!(
+            status(serde_json::json!({
+                "hook_event_name": "Notification",
+                "notification_type": "permission_prompt",
+            })),
+            Some(AgentThreadStatus::WaitingForConfirmation)
+        );
+        assert_eq!(
+            status(serde_json::json!({
+                "hook_event_name": "Notification",
+                "notification_type": "idle_prompt",
+            })),
+            None
+        );
+        assert_eq!(
+            status(serde_json::json!({
+                "hook_event_name": "Notification",
+                "message": "Claude needs your permission to use Bash",
+            })),
+            Some(AgentThreadStatus::WaitingForConfirmation)
+        );
+        assert_eq!(
+            status(serde_json::json!({ "hook_event_name": "Stop" })),
+            Some(AgentThreadStatus::Completed)
+        );
+    }
 }

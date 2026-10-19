@@ -102,7 +102,11 @@ where
 
 pub fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
-        let settings_store = SettingsStore::test(cx);
+        let mut settings_store = SettingsStore::test(cx);
+        // Tests cover the agent panel, which `use_cli` keeps closed.
+        settings_store.update_user_settings(cx, |settings| {
+            settings.agent.get_or_insert_default().use_cli = Some(false);
+        });
         cx.set_global(settings_store);
         // Use an isolated DB so parallel tests can't see each other's
         // persisted records (e.g. created-worktree records).

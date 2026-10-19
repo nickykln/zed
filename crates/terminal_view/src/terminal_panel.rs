@@ -438,15 +438,7 @@ impl TerminalPanel {
         match event {
             pane::Event::ActivateItem { .. } => {
                 self.serialize(cx);
-                let activated_task_label = pane
-                    .read(cx)
-                    .active_item()
-                    .and_then(|item| item.downcast::<TerminalView>())
-                    .and_then(|terminal_view| {
-                        let terminal = terminal_view.read(cx).terminal().read(cx);
-                        Some(terminal.task()?.spawned_task.full_label.clone())
-                    });
-                if let Some(label) = activated_task_label {
+                if let Some(label) = active_task_label(pane, cx) {
                     cx.emit(TerminalPanelEvent::TaskTerminalActivated { label });
                 }
             }
@@ -534,6 +526,9 @@ impl TerminalPanel {
             }
             pane::Event::Focus => {
                 self.active_pane = pane.clone();
+                if let Some(label) = active_task_label(pane, cx) {
+                    cx.emit(TerminalPanelEvent::TaskTerminalActivated { label });
+                }
             }
             pane::Event::ItemPinned | pane::Event::ItemUnpinned => {
                 self.serialize(cx);
@@ -801,41 +796,26 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut App,
     ) -> bool {
-        let running_terminal =
-            self.terminals_for_task(label, cx)
-                .into_iter()
-                .rev()
-                .find(|(_, _, terminal_view)| {
-                    terminal_view
-                        .read(cx)
-                        .terminal()
-                        .read(cx)
-                        .task()
-                        .is_some_and(|task_state| task_state.status == TaskStatus::Running)
-                });
-        let Some((item_index, pane, _)) = running_terminal else {
+        let Some((item_index, pane, _)) = self.running_task_terminal(label, cx) else {
             return false;
         };
         self.activate_terminal_view(&pane, item_index, true, window, cx);
         true
     }
 
+    pub fn has_running_task_terminal(&self, label: &str, cx: &mut App) -> bool {
+        self.running_task_terminal(label, cx).is_some()
+    }
+
+    /// Label of the task running in the active tab of the panel's active pane.
+    pub fn active_task_label(&self, cx: &App) -> Option<String> {
+        active_task_label(&self.active_pane, cx)
+    }
+
     /// Types `input` in the terminal still running the task with this label.
     /// Returns `false` when there is none.
     pub fn send_input_to_task_terminal(&self, label: &str, input: &str, cx: &mut App) -> bool {
-        let running_terminal =
-            self.terminals_for_task(label, cx)
-                .into_iter()
-                .rev()
-                .find(|(_, _, terminal_view)| {
-                    terminal_view
-                        .read(cx)
-                        .terminal()
-                        .read(cx)
-                        .task()
-                        .is_some_and(|task_state| task_state.status == TaskStatus::Running)
-                });
-        let Some((_, _, terminal_view)) = running_terminal else {
+        let Some((_, _, terminal_view)) = self.running_task_terminal(label, cx) else {
             return false;
         };
         let terminal = terminal_view.read(cx).terminal().clone();
@@ -845,6 +825,17 @@ impl TerminalPanel {
         true
     }
 
+    /// Opens a shell in a new terminal of the panel.
+    pub fn open_shell_terminal(
+        &mut self,
+        working_directory: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_terminal_shell(false, working_directory, RevealStrategy::Always, window, cx)
+            .detach_and_log_err(cx);
+    }
+
     /// Renames the tabs of the terminals running the task with this label.
     pub fn set_task_terminal_title(&self, label: &str, title: &str, cx: &mut App) {
         for (_, _, terminal_view) in self.terminals_for_task(label, cx) {
@@ -852,6 +843,24 @@ impl TerminalPanel {
                 terminal_view.set_custom_title(Some(title.to_string()), cx);
             });
         }
+    }
+
+    fn running_task_terminal(
+        &self,
+        label: &str,
+        cx: &mut App,
+    ) -> Option<(usize, Entity<Pane>, Entity<TerminalView>)> {
+        self.terminals_for_task(label, cx)
+            .into_iter()
+            .rev()
+            .find(|(_, _, terminal_view)| {
+                terminal_view
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .task()
+                    .is_some_and(|task_state| task_state.status == TaskStatus::Running)
+            })
     }
 
     fn terminals_for_task(
@@ -1546,6 +1555,13 @@ impl workspace::Item for FailedToSpawnTerminal {
 }
 
 impl EventEmitter<PanelEvent> for TerminalPanel {}
+
+/// Label of the task running in the active tab of `pane`.
+pub fn active_task_label(pane: &Entity<Pane>, cx: &App) -> Option<String> {
+    let terminal_view = pane.read(cx).active_item()?.downcast::<TerminalView>()?;
+    let terminal = terminal_view.read(cx).terminal().read(cx);
+    Some(terminal.task()?.spawned_task.full_label.clone())
+}
 
 pub enum TerminalPanelEvent {
     /// A terminal running a task became the active tab of one of the panel's panes.

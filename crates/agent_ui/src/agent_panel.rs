@@ -5115,6 +5115,19 @@ impl Panel for AgentPanel {
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.is_active = active;
+        // With agent CLIs, agents run in the terminal panel, so this panel is
+        // closed again whatever opened it.
+        if active && AgentSettings::get_global(cx).use_cli {
+            let workspace = self.workspace.clone();
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.close_panel::<AgentPanel>(window, cx);
+                    })
+                    .log_err();
+            });
+            return;
+        }
         if active {
             self.ensure_thread_initialized(window, cx);
         }

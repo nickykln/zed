@@ -54,7 +54,11 @@ fn set_max_idle_retained_threads(max_idle_retained_threads: usize, cx: &mut App)
 fn init_test(cx: &mut TestAppContext) {
     use_unique_metadata_databases(cx);
     cx.update(|cx| {
-        let settings_store = SettingsStore::test(cx);
+        let mut settings_store = SettingsStore::test(cx);
+        // Tests cover the agent panel, which `use_cli` keeps closed.
+        settings_store.update_user_settings(cx, |settings| {
+            settings.agent.get_or_insert_default().use_cli = Some(false);
+        });
         cx.set_global(settings_store);
         // Use an isolated DB so parallel tests can't see each other's
         // persisted records (e.g. created-worktree records).
@@ -2221,6 +2225,72 @@ fn setup_sidebar_with_agent_panel(
     let workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
     let panel = add_agent_panel(&workspace, cx);
     (sidebar, panel)
+}
+
+#[gpui::test]
+async fn test_agent_panel_closes_again_with_agent_clis(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (_sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
+    cx.update(|_window, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().use_cli = Some(true);
+            });
+        });
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.focus_panel::<AgentPanel>(window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.update(|_window, cx| {
+        assert!(!AgentPanel::is_visible(&workspace, cx));
+        assert!(!workspace.read(cx).left_dock().read(cx).is_open());
+    });
+}
+
+#[gpui::test]
+async fn test_agent_panel_drafts_are_hidden_with_agent_clis(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let connection = StubAgentConnection::new();
+    connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+        acp_v1::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(&panel, connection, cx);
+    send_message(&panel, cx);
+    let session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&session_id, &project, cx).await;
+    panel.update_in(cx, |panel, window, cx| {
+        panel.new_thread(&NewThread, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  New stub Thread", "  Hello *"],
+    );
+
+    cx.update(|_window, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().use_cli = Some(true);
+            });
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *"],
+    );
 }
 
 #[gpui::test]
