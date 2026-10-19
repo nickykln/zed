@@ -777,10 +777,7 @@ fn write_claude_status_settings(session_id: &acp_v2::SessionId) -> Result<PathBu
     {
         return Err(error.into());
     }
-    let quoted_status_file = format!(
-        "'{}'",
-        status_file.to_string_lossy().replace('\'', "'\\''")
-    );
+    let quoted_status_file = format!("'{}'", status_file.to_string_lossy().replace('\'', "'\\''"));
     let hook = serde_json::json!([{
         "matcher": "*",
         "hooks": [{ "type": "command", "command": format!("cat > {quoted_status_file}") }],
@@ -815,7 +812,10 @@ fn status_from_hook_input(hook_input: &serde_json::Value) -> Option<AgentThreadS
         "Notification" => {
             let asks_the_user = match field("notification_type") {
                 Some(notification_type) => {
-                    matches!(notification_type, "permission_prompt" | "elicitation_dialog")
+                    matches!(
+                        notification_type,
+                        "permission_prompt" | "elicitation_dialog"
+                    )
                 }
                 // Older versions don't send a type, only the message.
                 None => field("message").is_some_and(|message| message.contains("permission")),

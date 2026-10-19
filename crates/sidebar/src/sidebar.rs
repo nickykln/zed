@@ -7344,15 +7344,20 @@ impl Sidebar {
         }
         match self.new_session_agent {
             NewSessionAgent::Cli(agent) => {
-                self.when_terminal_panel_loaded(workspace, window, cx, move |workspace, window, cx| {
-                    agent_ui::open_new_thread_in_terminal_panel(
-                        workspace,
-                        agent,
-                        workspace_path_list(workspace, cx),
-                        window,
-                        cx,
-                    );
-                });
+                self.when_terminal_panel_loaded(
+                    workspace,
+                    window,
+                    cx,
+                    move |workspace, window, cx| {
+                        agent_ui::open_new_thread_in_terminal_panel(
+                            workspace,
+                            agent,
+                            workspace_path_list(workspace, cx),
+                            window,
+                            cx,
+                        );
+                    },
+                );
             }
             NewSessionAgent::Terminal => self.create_new_terminal(workspace, window, cx),
         }
@@ -7368,7 +7373,11 @@ impl Sidebar {
         cx: &mut Context<Self>,
         callback: impl FnOnce(&Entity<Workspace>, &mut Window, &mut App) + 'static,
     ) {
-        if workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx).is_some() {
+        if workspace
+            .read(cx)
+            .panel::<agent_ui::TerminalPanel>(cx)
+            .is_some()
+        {
             callback(workspace, window, cx);
             return;
         }
@@ -7511,7 +7520,8 @@ impl Sidebar {
         if AgentSettings::get_global(cx).use_cli {
             let working_directory = workspace_path_list(workspace, cx).paths().first().cloned();
             self.when_terminal_panel_loaded(workspace, window, cx, move |workspace, window, cx| {
-                if let Some(terminal_panel) = workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx)
+                if let Some(terminal_panel) =
+                    workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx)
                 {
                     terminal_panel.update(cx, |terminal_panel, cx| {
                         terminal_panel.open_shell_terminal(working_directory, window, cx);
