@@ -807,6 +807,14 @@ impl TerminalPanel {
         self.running_task_terminal(label, cx).is_some()
     }
 
+    /// Whether the terminal running the task with this label has the focus.
+    pub fn is_task_terminal_focused(&self, label: &str, window: &Window, cx: &mut App) -> bool {
+        self.running_task_terminal(label, cx)
+            .is_some_and(|(_, _, terminal_view)| {
+                terminal_view.focus_handle(cx).contains_focused(window, cx)
+            })
+    }
+
     /// Label of the task running in the active tab of the panel's active pane.
     pub fn active_task_label(&self, cx: &App) -> Option<String> {
         active_task_label(&self.active_pane, cx)

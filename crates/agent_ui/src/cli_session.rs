@@ -2,17 +2,23 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v2 as acp_v2;
+use agent_settings::AgentSettings;
 use anyhow::Result;
 use collections::{HashMap, HashSet};
-use gpui::{App, Entity, Global, TaskExt as _, Window};
+use gpui::{
+    AnyWindowHandle, App, AppContext as _, Entity, Global, Subscription, TaskExt as _, WeakEntity,
+    Window, WindowHandle,
+};
 use project::AgentId;
+use settings::{NotifyWhenAgentWaiting, Settings as _};
 use task::{HideStrategy, RevealStrategy, RevealTarget, Shell, SpawnInTerminal, TaskId};
 use terminal_view::terminal_panel::{self, TerminalPanel};
-use ui::AgentThreadStatus;
+use ui::{AgentThreadStatus, IconName};
 use util::ResultExt as _;
-use workspace::{Pane, PathList, Workspace};
+use workspace::{MultiWorkspace, Pane, PathList, Workspace};
 
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths};
+use crate::ui::{AgentNotification, AgentNotificationEvent};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const ENTER_DELAY: Duration = Duration::from_millis(500);
@@ -174,6 +180,7 @@ impl CliAgent {
         session_id: &acp_v2::SessionId,
         terminal_labels: &[String],
         terminal_panel: &Entity<TerminalPanel>,
+        window: &Window,
         cx: &mut App,
     ) -> Vec<String> {
         if self != CliAgent::Claude {
@@ -186,6 +193,7 @@ impl CliAgent {
             session_id.clone(),
             terminal_labels.to_vec(),
             terminal_panel.downgrade(),
+            window.window_handle(),
             cx,
         );
         vec![
@@ -268,6 +276,13 @@ pub struct CliSessions {
     watched_statuses: HashSet<acp_v2::SessionId>,
     /// Latest status reported by the hooks of each running session.
     statuses: HashMap<acp_v2::SessionId, AgentThreadStatus>,
+    /// Pop-ups telling that a session waits for the user.
+    notifications: HashMap<acp_v2::SessionId, SessionNotification>,
+}
+
+struct SessionNotification {
+    windows: Vec<WindowHandle<AgentNotification>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Global for CliSessions {}
@@ -439,7 +454,13 @@ pub fn open_thread_in_terminal_panel(
             .any(|label| terminal_panel.has_running_task_terminal(label, cx))
     });
     if !already_running {
-        arguments.extend(agent.status_arguments(session_id, &reusable_labels, &terminal_panel, cx));
+        arguments.extend(agent.status_arguments(
+            session_id,
+            &reusable_labels,
+            &terminal_panel,
+            window,
+            cx,
+        ));
     }
     spawn_in_terminal_panel(
         workspace,
@@ -492,6 +513,7 @@ pub fn open_new_thread_in_terminal_panel(
                 &session_id,
                 std::slice::from_ref(&resume_label),
                 &terminal_panel,
+                window,
                 cx,
             ));
             spawn_in_terminal_panel(
@@ -832,6 +854,7 @@ fn watch_session_status(
     session_id: acp_v2::SessionId,
     terminal_labels: Vec<String>,
     terminal_panel: gpui::WeakEntity<TerminalPanel>,
+    window: AnyWindowHandle,
     cx: &mut App,
 ) {
     if !cx
@@ -896,10 +919,20 @@ fn watch_session_status(
                 continue;
             };
             cx.update(|cx| {
-                if session_status(&session_id, cx) != Some(status) {
+                let previous_status = session_status(&session_id, cx);
+                if previous_status != Some(status) {
                     cx.default_global::<CliSessions>()
                         .statuses
                         .insert(session_id.clone(), status);
+                    notify_status_change(
+                        &session_id,
+                        previous_status,
+                        status,
+                        &terminal_labels,
+                        &terminal_panel,
+                        window,
+                        cx,
+                    );
                 }
             });
         }
@@ -907,9 +940,185 @@ fn watch_session_status(
             let sessions = cx.default_global::<CliSessions>();
             sessions.watched_statuses.remove(&session_id);
             sessions.statuses.remove(&session_id);
+            dismiss_session_notification(&session_id, cx);
         });
     })
     .detach();
+}
+
+/// Tells the user that a session waits for them, the way the agent panel does
+/// for its threads: with a sound and a pop-up, unless they are looking at the
+/// session's terminal.
+fn notify_status_change(
+    session_id: &acp_v2::SessionId,
+    previous_status: Option<AgentThreadStatus>,
+    status: AgentThreadStatus,
+    terminal_labels: &[String],
+    terminal_panel: &WeakEntity<TerminalPanel>,
+    window_handle: AnyWindowHandle,
+    cx: &mut App,
+) {
+    dismiss_session_notification(session_id, cx);
+    let Some((caption, icon)) = status_change_notification(previous_status, status) else {
+        return;
+    };
+    let Some(terminal_panel) = terminal_panel.upgrade() else {
+        return;
+    };
+    let metadata = ThreadMetadataStore::global(cx)
+        .read(cx)
+        .entry_by_session(session_id)
+        .cloned();
+    let title = metadata
+        .as_ref()
+        .map(|metadata| metadata.display_title())
+        .unwrap_or_else(|| CliAgent::Claude.name().into());
+    let project_name = metadata.as_ref().and_then(|metadata| {
+        let path = metadata.folder_paths().paths().first()?.clone();
+        Some(path.file_name()?.to_string_lossy().into_owned())
+    });
+
+    window_handle
+        .update(cx, |_, window, cx| {
+            let visible = window.is_window_active()
+                && terminal_labels.iter().any(|label| {
+                    terminal_panel.update(cx, |terminal_panel, cx| {
+                        terminal_panel.is_task_terminal_focused(label, window, cx)
+                    })
+                });
+            #[cfg(feature = "audio")]
+            if AgentSettings::get_global(cx)
+                .play_sound_when_agent_done
+                .should_play(visible)
+            {
+                audio::Audio::play_sound(audio::Sound::AgentDone, cx);
+            }
+            if visible {
+                return;
+            }
+            let screens = match AgentSettings::get_global(cx).notify_when_agent_waiting {
+                NotifyWhenAgentWaiting::PrimaryScreen => cx.primary_display().into_iter().collect(),
+                NotifyWhenAgentWaiting::AllScreens => cx.displays(),
+                NotifyWhenAgentWaiting::Never => Vec::new(),
+            };
+            if screens.is_empty() {
+                return;
+            }
+            window.request_attention();
+
+            let mut windows = Vec::new();
+            let mut subscriptions = Vec::new();
+            for screen in screens {
+                let Some(pop_up_window) = cx
+                    .open_window(AgentNotification::window_options(screen, cx), |_, cx| {
+                        cx.new(|_| {
+                            AgentNotification::new(
+                                title.clone(),
+                                Some(caption.into()),
+                                icon,
+                                project_name.clone(),
+                            )
+                        })
+                    })
+                    .log_err()
+                else {
+                    continue;
+                };
+                let Some(pop_up) = pop_up_window.entity(cx).log_err() else {
+                    continue;
+                };
+                subscriptions.push(cx.subscribe(&pop_up, {
+                    let session_id = session_id.clone();
+                    let terminal_labels = terminal_labels.to_vec();
+                    let terminal_panel = terminal_panel.downgrade();
+                    move |_, event: &AgentNotificationEvent, cx| {
+                        if let AgentNotificationEvent::Accepted = event {
+                            show_session_terminal(
+                                &terminal_labels,
+                                &terminal_panel,
+                                window_handle,
+                                cx,
+                            );
+                        }
+                        dismiss_session_notification(&session_id, cx);
+                    }
+                }));
+                windows.push(pop_up_window);
+            }
+            cx.default_global::<CliSessions>().notifications.insert(
+                session_id.clone(),
+                SessionNotification {
+                    windows,
+                    _subscriptions: subscriptions,
+                },
+            );
+        })
+        .log_err();
+}
+
+/// Caption and icon of the notification for a status change, if it calls
+/// for one: the session finished working, or waits for an answer.
+fn status_change_notification(
+    previous_status: Option<AgentThreadStatus>,
+    status: AgentThreadStatus,
+) -> Option<(&'static str, IconName)> {
+    match status {
+        AgentThreadStatus::Completed if previous_status == Some(AgentThreadStatus::Running) => {
+            Some(("Finished", IconName::ZedAssistant))
+        }
+        AgentThreadStatus::WaitingForConfirmation => Some(("Waiting for input", IconName::Info)),
+        _ => None,
+    }
+}
+
+/// Brings the window, the workspace and the terminal of a session to the front.
+fn show_session_terminal(
+    terminal_labels: &[String],
+    terminal_panel: &WeakEntity<TerminalPanel>,
+    window: AnyWindowHandle,
+    cx: &mut App,
+) {
+    let Some(terminal_panel) = terminal_panel.upgrade() else {
+        return;
+    };
+    cx.activate(true);
+    let Some(window) = window.downcast::<MultiWorkspace>() else {
+        return;
+    };
+    window
+        .update(cx, |multi_workspace, window, cx| {
+            window.activate_window();
+            let workspace = multi_workspace
+                .workspaces()
+                .find(|workspace| {
+                    workspace.read(cx).panel::<TerminalPanel>(cx).as_ref() == Some(&terminal_panel)
+                })
+                .cloned();
+            if let Some(workspace) = workspace {
+                multi_workspace.activate(workspace, None, window, cx);
+            }
+            terminal_panel.update(cx, |terminal_panel, cx| {
+                terminal_labels
+                    .iter()
+                    .any(|label| terminal_panel.activate_running_task_terminal(label, window, cx))
+            });
+        })
+        .log_err();
+}
+
+fn dismiss_session_notification(session_id: &acp_v2::SessionId, cx: &mut App) {
+    let Some(notification) = cx
+        .default_global::<CliSessions>()
+        .notifications
+        .remove(session_id)
+    else {
+        return;
+    };
+    for window in notification.windows {
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .log_err();
+    }
 }
 
 fn spawn_in_terminal_panel(
@@ -986,6 +1195,35 @@ mod tests {
             }
             assert_eq!(session_id_for_terminal_label("claude", cx), None);
         });
+    }
+
+    #[test]
+    fn test_status_change_notification() {
+        let caption = |previous_status, status| {
+            status_change_notification(previous_status, status).map(|(caption, _)| caption)
+        };
+        assert_eq!(
+            caption(
+                Some(AgentThreadStatus::Running),
+                AgentThreadStatus::Completed
+            ),
+            Some("Finished")
+        );
+        assert_eq!(
+            caption(
+                Some(AgentThreadStatus::Running),
+                AgentThreadStatus::WaitingForConfirmation
+            ),
+            Some("Waiting for input")
+        );
+        assert_eq!(
+            caption(
+                Some(AgentThreadStatus::WaitingForConfirmation),
+                AgentThreadStatus::Running
+            ),
+            None
+        );
+        assert_eq!(caption(None, AgentThreadStatus::Completed), None);
     }
 
     #[test]
