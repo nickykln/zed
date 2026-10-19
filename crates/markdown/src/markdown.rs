@@ -1062,7 +1062,6 @@ impl Markdown {
         self.parse(cx);
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn parsed_markdown(&self) -> &ParsedMarkdown {
         &self.parsed_markdown
     }
@@ -1485,6 +1484,47 @@ impl Selection {
     }
 }
 
+/// Source ranges of the root blocks of `text`, parsed the way a [`Markdown`]
+/// with HTML and metadata blocks parses it.
+pub fn root_block_ranges(text: &str) -> Vec<Range<usize>> {
+    root_block_ranges_in_events(&parse_markdown_with_options(text, true, false, true).events)
+}
+
+fn root_block_ranges_in_events(events: &[(Range<usize>, MarkdownEvent)]) -> Vec<Range<usize>> {
+    events
+        .iter()
+        .filter(|(_, event)| matches!(event, MarkdownEvent::RootStart))
+        .map(|(range, _)| range.clone())
+        .collect()
+}
+
+/// Decoration of a root block of a [`MarkdownElement`].
+#[derive(Default)]
+pub struct RootBlockDecoration {
+    /// Replaces the marker shown in the gutter of the block.
+    pub gutter: Option<RootBlockGutter>,
+    pub content: RootBlockContent,
+    /// Shown above the block.
+    pub before: Option<AnyElement>,
+    /// Shown below the block.
+    pub after: Option<AnyElement>,
+}
+
+pub struct RootBlockGutter {
+    pub color: Hsla,
+    pub tooltip: Option<SharedString>,
+    pub on_click: Option<Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>>,
+}
+
+#[derive(Default)]
+pub enum RootBlockContent {
+    #[default]
+    Rendered,
+    /// Shows this element in place of the rendered block.
+    Replaced(AnyElement),
+    Hidden,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ParsedMarkdown {
     pub source: SharedString,
@@ -1518,6 +1558,11 @@ impl ParsedMarkdown {
 
     pub fn root_block_starts(&self) -> &Arc<[usize]> {
         &self.root_block_starts
+    }
+
+    /// Source ranges of the root blocks, in order.
+    pub fn root_block_ranges(&self) -> Vec<Range<usize>> {
+        root_block_ranges_in_events(&self.events)
     }
 
     fn non_rendered_source_ranges(&self) -> Vec<Range<usize>> {
@@ -1741,6 +1786,7 @@ pub struct MarkdownElement {
     on_mermaid_zoom: Option<MermaidZoomCallback>,
     image_resolver: Option<Box<dyn Fn(&str, &App) -> Option<ImageSource>>>,
     show_root_block_markers: bool,
+    root_block_decorations: HashMap<usize, RootBlockDecoration>,
     autoscroll: AutoscrollBehavior,
     /// Test-only hook to observe the laid-out text when this element is
     /// rendered beneath a view, where the layout state isn't otherwise
@@ -1768,6 +1814,7 @@ impl MarkdownElement {
             on_mermaid_zoom: None,
             image_resolver: None,
             show_root_block_markers: false,
+            root_block_decorations: HashMap::default(),
             autoscroll: AutoscrollBehavior::Propagate,
             #[cfg(test)]
             on_render: None,
@@ -1871,6 +1918,16 @@ impl MarkdownElement {
 
     pub fn show_root_block_markers(mut self) -> Self {
         self.show_root_block_markers = true;
+        self
+    }
+
+    /// Decorates root blocks, keyed by their index. Requires
+    /// [`Self::show_root_block_markers`].
+    pub fn root_block_decorations(
+        mut self,
+        decorations: HashMap<usize, RootBlockDecoration>,
+    ) -> Self {
+        self.root_block_decorations = decorations;
         self
     }
 
@@ -2643,8 +2700,19 @@ impl Element for MarkdownElement {
         let mut handled_html_block = false;
         let mut rendered_mermaid_block = false;
         let mut rendered_metadata_block = false;
+        let mut root_block_decorations = mem::take(&mut self.root_block_decorations);
+        let mut next_root_block_index = 0;
+        let mut active_decoration: Option<RootBlockDecoration> = None;
+        let mut skipped_root_block = None;
         for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
             let event_index = MarkdownEventIndex(index);
+            if let Some(skipped_root_block_index) = skipped_root_block {
+                if matches!(event, MarkdownEvent::RootEnd(root_block_index) if *root_block_index == skipped_root_block_index)
+                {
+                    skipped_root_block = None;
+                }
+                continue;
+            }
             // Skip alt text for images that rendered
             if let Some(current_img_block_range) = &current_img_block_range
                 && current_img_block_range.end > range.end
@@ -2676,17 +2744,57 @@ impl Element for MarkdownElement {
 
             match event {
                 MarkdownEvent::RootStart => {
+                    let root_block_index = next_root_block_index;
+                    next_root_block_index += 1;
                     if self.show_root_block_markers {
-                        builder.push_root_block(range, markdown_end);
+                        let mut decoration = root_block_decorations
+                            .remove(&root_block_index)
+                            .unwrap_or_default();
+                        if let Some(before) = decoration.before.take() {
+                            builder.append_child(before);
+                        }
+                        match mem::take(&mut decoration.content) {
+                            RootBlockContent::Rendered => {
+                                builder.push_root_block(range, markdown_end);
+                                active_decoration = Some(decoration);
+                            }
+                            RootBlockContent::Replaced(replacement) => {
+                                builder.push_root_block(range, markdown_end);
+                                builder.append_child(replacement);
+                                builder.pop_root_block(
+                                    root_block_index,
+                                    active_root_block == Some(root_block_index),
+                                    decoration.gutter,
+                                    cx.theme().colors().border,
+                                    cx.theme().colors().border_variant,
+                                );
+                                if let Some(after) = decoration.after {
+                                    builder.append_child(after);
+                                }
+                                skipped_root_block = Some(root_block_index);
+                            }
+                            RootBlockContent::Hidden => {
+                                if let Some(after) = decoration.after {
+                                    builder.append_child(after);
+                                }
+                                skipped_root_block = Some(root_block_index);
+                            }
+                        }
                     }
                 }
                 MarkdownEvent::RootEnd(root_block_index) => {
                     if self.show_root_block_markers {
+                        let decoration = active_decoration.take().unwrap_or_default();
                         builder.pop_root_block(
+                            *root_block_index,
                             active_root_block == Some(*root_block_index),
+                            decoration.gutter,
                             cx.theme().colors().border,
                             cx.theme().colors().border_variant,
                         );
+                        if let Some(after) = decoration.after {
+                            builder.append_child(after);
+                        }
                     }
                 }
                 MarkdownEvent::Start(tag) => {
@@ -4049,13 +4157,32 @@ impl MarkdownElementBuilder {
 
     fn pop_root_block(
         &mut self,
+        root_block_index: usize,
         is_active: bool,
+        gutter: Option<RootBlockGutter>,
         active_gutter_color: Hsla,
         hovered_gutter_color: Hsla,
     ) {
         self.pop_div();
-        self.modify_current_div(|el| {
-            el.child(
+        self.modify_current_div(|el| match gutter {
+            Some(gutter) => el.child(
+                div()
+                    .id(("markdown-root-block-gutter", root_block_index))
+                    .h_full()
+                    .w(px(12.0))
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .when_some(gutter.on_click, |this, on_click| {
+                        this.cursor_pointer()
+                            .on_click(move |event, window, cx| on_click(event, window, cx))
+                    })
+                    .when_some(gutter.tooltip, |this, tooltip| {
+                        this.tooltip(Tooltip::text(tooltip))
+                    })
+                    .child(div().h_full().w(px(4.0)).bg(gutter.color).rounded_xs()),
+            ),
+            None => el.child(
                 div()
                     .h_full()
                     .w(px(4.0))
@@ -4071,7 +4198,7 @@ impl MarkdownElementBuilder {
                     .absolute()
                     .left_0()
                     .top_0(),
-            )
+            ),
         });
         self.pop_div();
     }
@@ -5289,6 +5416,63 @@ mod tests {
             })
             .into_any_element()
         });
+    }
+
+    #[gpui::test]
+    fn test_root_block_decorations_replace_and_hide_blocks(cx: &mut TestAppContext) {
+        struct DecoratedMarkdown {
+            markdown: Entity<Markdown>,
+            rendered_text: Rc<RefCell<Option<RenderedText>>>,
+        }
+
+        impl Render for DecoratedMarkdown {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut decorations = HashMap::default();
+                decorations.insert(
+                    1,
+                    RootBlockDecoration {
+                        content: RootBlockContent::Hidden,
+                        ..Default::default()
+                    },
+                );
+                decorations.insert(
+                    2,
+                    RootBlockDecoration {
+                        content: RootBlockContent::Replaced(div().into_any_element()),
+                        ..Default::default()
+                    },
+                );
+                let rendered_text = self.rendered_text.clone();
+                MarkdownElement::new(self.markdown.clone(), MarkdownStyle::default())
+                    .show_root_block_markers()
+                    .root_block_decorations(decorations)
+                    .on_render(move |text| *rendered_text.borrow_mut() = Some(text))
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let markdown =
+            cx.new(|cx| Markdown::new("First.\n\nSecond.\n\nThird.\n".into(), None, None, cx));
+        cx.run_until_parked();
+        let rendered_text = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let rendered_text = rendered_text.clone();
+            move |_, _| DecoratedMarkdown {
+                markdown,
+                rendered_text,
+            }
+        });
+        cx.run_until_parked();
+
+        let text = rendered_text
+            .borrow()
+            .as_ref()
+            .expect("markdown should be rendered")
+            .lines
+            .iter()
+            .map(|line| line.layout.wrapped_text())
+            .collect::<Vec<_>>();
+        assert_eq!(text, vec!["First."]);
     }
 
     #[gpui::test]

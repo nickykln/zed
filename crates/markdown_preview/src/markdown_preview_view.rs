@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use buffer_diff::{BufferDiff, BufferDiffEvent};
+use collections::HashMap;
 use editor::items::open_resolved_target;
 use editor::scroll::Autoscroll;
 use editor::{
@@ -19,10 +21,10 @@ use gpui::{
     Resource, RetainAllImageCache, ScrollHandle, SharedString, SharedUri, Subscription, Task,
     WeakEntity, Window, point, px,
 };
-use language::{Buffer, LanguageRegistry};
+use language::{Buffer, LanguageRegistry, ToOffset as _};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
-    MarkdownOptions, MarkdownStyle,
+    MarkdownOptions, MarkdownStyle, RootBlockContent, RootBlockDecoration, RootBlockGutter,
 };
 use project::search::SearchQuery;
 use project::{Project, ProjectPath, image_store};
@@ -31,7 +33,8 @@ use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
 use ui::{
-    ContextMenu, LinkPreview, ScrollAxes, Scrollbars, WithScrollbar, prelude::*, right_click_menu,
+    ContextMenu, LinkPreview, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*,
+    right_click_menu,
 };
 use util::{
     ResultExt,
@@ -52,12 +55,16 @@ use workspace::{
 };
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
+use crate::markdown_preview_diff::{BlockChange, ChangeKind, Hunk, block_changes};
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
 use crate::{
     CloseAndReturnToEditor, OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide, ScrollDown,
     ScrollDownByItem,
 };
-use crate::{ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ScrollUp, ScrollUpByItem};
+use crate::{
+    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ScrollUp, ScrollUpByItem,
+    ToggleChanges,
+};
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
 
@@ -85,6 +92,31 @@ pub struct MarkdownPreviewView {
     /// background parse is in flight. Tracked so matches can be invalidated once it lands.
     markdown_parse_pending: bool,
     nav_history: Option<ItemNavHistory>,
+    language_registry: Arc<LanguageRegistry>,
+    show_changes: bool,
+    changes: Option<PreviewChanges>,
+}
+
+/// Changes of the previewed buffer since the last commit.
+struct PreviewChanges {
+    buffer_diff: Entity<BufferDiff>,
+    _buffer_diff_subscription: Subscription,
+    /// The source the hunks were read along with, so their offsets apply to it.
+    source: SharedString,
+    hunks: Vec<Hunk>,
+    old_text: SharedString,
+    old_blocks: Vec<Range<usize>>,
+    /// Computed once the preview has parsed `source`.
+    block_changes: Vec<BlockChange>,
+    /// Changes showing their committed text, keyed by where that text starts,
+    /// which stays put while the buffer is edited.
+    expanded: HashMap<usize, ExpandedChange>,
+}
+
+struct ExpandedChange {
+    before: Entity<Markdown>,
+    /// `None` for a deletion.
+    after: Option<Entity<Markdown>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -390,15 +422,9 @@ impl MarkdownPreviewView {
             let markdown = cx.new(|cx| {
                 Markdown::new_with_options(
                     SharedString::default(),
-                    Some(language_registry),
+                    Some(language_registry.clone()),
                     None,
-                    MarkdownOptions {
-                        parse_html: true,
-                        render_mermaid_diagrams: true,
-                        parse_heading_slugs: true,
-                        render_metadata_blocks: true,
-                        ..Default::default()
-                    },
+                    preview_markdown_options(),
                     cx,
                 )
             });
@@ -411,6 +437,7 @@ impl MarkdownPreviewView {
                     &markdown,
                     |this: &mut Self, markdown: Entity<Markdown>, cx| {
                         this.sync_active_root_block(cx);
+                        this.refresh_block_changes(cx);
                         let is_parsing = markdown.read(cx).is_parsing();
                         if this.markdown_parse_pending && !is_parsing {
                             cx.emit(SearchEvent::MatchesInvalidated);
@@ -428,6 +455,9 @@ impl MarkdownPreviewView {
                 mode,
                 markdown_parse_pending: false,
                 nav_history: None,
+                language_registry,
+                show_changes: false,
+                changes: None,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -599,6 +629,9 @@ impl MarkdownPreviewView {
             _subscription: subscription,
         });
         self.update_markdown_from_active_editor(false, true, window, cx);
+        if self.show_changes {
+            self.load_changes(window, cx);
+        }
         if had_active_editor {
             cx.emit(MarkdownPreviewEvent::SourceEditorChanged);
         }
@@ -690,7 +723,7 @@ impl MarkdownPreviewView {
                 }
 
                 editor.update(cx, |editor, cx| {
-                    let contents = editor
+                    let contents: SharedString = editor
                         .buffer()
                         .read(cx)
                         .as_singleton()?
@@ -707,8 +740,9 @@ impl MarkdownPreviewView {
                 if let Some((contents, selection_start)) = update {
                     view.hovered_url = None;
                     view.markdown.update(cx, |markdown, cx| {
-                        markdown.reset(contents, cx);
+                        markdown.reset(contents.clone(), cx);
                     });
+                    view.read_hunks(contents, cx);
                     view.markdown_parse_pending = view.markdown.read(cx).is_parsing();
                     view.sync_preview_to_source_index(selection_start, should_reveal_selection, cx);
                     cx.emit(SearchEvent::MatchesInvalidated);
@@ -717,6 +751,291 @@ impl MarkdownPreviewView {
                 cx.notify();
             })
         })
+    }
+
+    fn active_buffer(&self, cx: &App) -> Option<Entity<Buffer>> {
+        self.active_editor
+            .as_ref()?
+            .editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()
+    }
+
+    fn toggle_changes(&mut self, _: &ToggleChanges, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_changes = !self.show_changes;
+        if self.show_changes {
+            self.load_changes(window, cx);
+        } else {
+            self.changes = None;
+        }
+        cx.notify();
+    }
+
+    /// Loads the diff of the previewed buffer against its last commit.
+    fn load_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes = None;
+        let Some(buffer) = self.active_buffer(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        let buffer_diff = project.update(cx, |project, cx| {
+            project.open_uncommitted_diff(buffer.clone(), cx)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let buffer_diff = buffer_diff.await?;
+            this.update_in(cx, |this, window, cx| {
+                // The preview may have moved on while the diff was loading.
+                if !this.show_changes || this.active_buffer(cx) != Some(buffer) {
+                    return;
+                }
+                let subscription = cx.subscribe_in(
+                    &buffer_diff,
+                    window,
+                    |this, _, _: &BufferDiffEvent, window, cx| {
+                        this.update_markdown_from_active_editor(true, false, window, cx);
+                    },
+                );
+                this.changes = Some(PreviewChanges {
+                    buffer_diff,
+                    _buffer_diff_subscription: subscription,
+                    source: SharedString::default(),
+                    hunks: Vec::new(),
+                    old_text: SharedString::default(),
+                    old_blocks: Vec::new(),
+                    block_changes: Vec::new(),
+                    expanded: HashMap::default(),
+                });
+                this.update_markdown_from_active_editor(false, false, window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Reads the hunks of the buffer, whose text is `source`.
+    fn read_hunks(&mut self, source: SharedString, cx: &mut Context<Self>) {
+        let Some(buffer) = self.active_buffer(cx) else {
+            return;
+        };
+        let Some(changes) = self.changes.as_mut() else {
+            return;
+        };
+        let buffer_snapshot = buffer.read(cx).text_snapshot();
+        let diff_snapshot = changes.buffer_diff.read(cx).snapshot(cx);
+        changes.hunks = diff_snapshot
+            .hunks(&buffer_snapshot)
+            .map(|hunk| Hunk {
+                new: hunk.buffer_range.start.to_offset(&buffer_snapshot)
+                    ..hunk.buffer_range.end.to_offset(&buffer_snapshot),
+                old: hunk.diff_base_byte_range,
+            })
+            .collect();
+        let old_text = SharedString::from(diff_snapshot.base_text_string().unwrap_or_default());
+        if old_text != changes.old_text {
+            changes.old_blocks = markdown::root_block_ranges(&old_text);
+            changes.old_text = old_text;
+        }
+        changes.source = source;
+        self.refresh_block_changes(cx);
+    }
+
+    /// Maps the hunks to the root blocks once the preview shows their source.
+    fn refresh_block_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(changes) = self.changes.as_mut() else {
+            return;
+        };
+        let markdown = self.markdown.read(cx);
+        if markdown.is_parsing() || markdown.parsed_markdown().source() != &changes.source {
+            return;
+        }
+        let new_blocks = markdown.parsed_markdown().root_block_ranges();
+        changes.block_changes = block_changes(&new_blocks, &changes.old_blocks, &changes.hunks);
+
+        let mut texts = HashMap::default();
+        for change in &changes.block_changes {
+            if change.kind != ChangeKind::Added {
+                texts.insert(change.old_range.start, change_texts(changes, change));
+            }
+        }
+        changes.expanded.retain(|key, _| texts.contains_key(key));
+        for (key, expanded) in &changes.expanded {
+            let Some((before_text, after_text)) = texts.remove(key) else {
+                continue;
+            };
+            reset_markdown_source(&expanded.before, before_text, cx);
+            if let (Some(after), Some(after_text)) = (&expanded.after, after_text) {
+                reset_markdown_source(after, after_text, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_change(&mut self, key: usize, cx: &mut Context<Self>) {
+        let Some(changes) = self.changes.as_mut() else {
+            return;
+        };
+        if changes.expanded.remove(&key).is_none() {
+            let Some((before_text, after_text)) = changes
+                .block_changes
+                .iter()
+                .find(|change| change.kind != ChangeKind::Added && change.old_range.start == key)
+                .map(|change| change_texts(changes, change))
+            else {
+                return;
+            };
+            let language_registry = self.language_registry.clone();
+            let mut new_markdown = |text: SharedString| {
+                cx.new(|cx| {
+                    Markdown::new_with_options(
+                        text,
+                        Some(language_registry.clone()),
+                        None,
+                        preview_markdown_options(),
+                        cx,
+                    )
+                })
+            };
+            let expanded = ExpandedChange {
+                before: new_markdown(before_text),
+                after: after_text.map(new_markdown),
+            };
+            if let Some(changes) = self.changes.as_mut() {
+                changes.expanded.insert(key, expanded);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Decorations showing the changes, keyed by root block.
+    fn change_decorations(
+        &self,
+        markdown_style: &MarkdownStyle,
+        cx: &mut Context<Self>,
+    ) -> HashMap<usize, RootBlockDecoration> {
+        let mut decorations: HashMap<usize, RootBlockDecoration> = HashMap::default();
+        let Some(changes) = self.changes.as_ref().filter(|_| self.show_changes) else {
+            return decorations;
+        };
+        let parsed_markdown = self.markdown.read(cx).parsed_markdown();
+        if parsed_markdown.source() != &changes.source {
+            return decorations;
+        }
+        let block_count = parsed_markdown.root_block_starts().len();
+        let colors = cx.theme().colors();
+        let (added_color, modified_color, deleted_color) = (
+            colors.version_control_added,
+            colors.version_control_modified,
+            colors.version_control_deleted,
+        );
+        let view = cx.weak_entity();
+        let toggle = |key: usize| -> Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)> {
+            let view = view.clone();
+            Box::new(move |_, _, cx| {
+                view.update(cx, |view, cx| view.toggle_change(key, cx))
+                    .log_err();
+            })
+        };
+
+        for change in &changes.block_changes {
+            let key = change.old_range.start;
+            let expanded = changes.expanded.get(&key);
+            match change.kind {
+                ChangeKind::Added => {
+                    for block in change.blocks.clone() {
+                        decorations.entry(block).or_default().gutter = Some(RootBlockGutter {
+                            color: added_color,
+                            tooltip: Some("Added".into()),
+                            on_click: None,
+                        });
+                    }
+                }
+                ChangeKind::Modified => {
+                    let tooltip = if expanded.is_some() {
+                        "Hide Before and After"
+                    } else {
+                        "Show Before and After"
+                    };
+                    for block in change.blocks.clone() {
+                        let decoration = decorations.entry(block).or_default();
+                        decoration.gutter = Some(RootBlockGutter {
+                            color: modified_color,
+                            tooltip: Some(tooltip.into()),
+                            on_click: Some(toggle(key)),
+                        });
+                        decoration.content = match expanded {
+                            Some(expanded) if block == change.blocks.start => {
+                                RootBlockContent::Replaced(
+                                    h_flex()
+                                        .w_full()
+                                        .flex_wrap()
+                                        .items_start()
+                                        .gap_2()
+                                        .child(render_change_column(
+                                            "Before",
+                                            &expanded.before,
+                                            deleted_color,
+                                            markdown_style,
+                                        ))
+                                        .when_some(expanded.after.as_ref(), |this, after| {
+                                            this.child(render_change_column(
+                                                "After",
+                                                after,
+                                                added_color,
+                                                markdown_style,
+                                            ))
+                                        })
+                                        .into_any_element(),
+                                )
+                            }
+                            Some(_) => RootBlockContent::Hidden,
+                            None => RootBlockContent::Rendered,
+                        };
+                    }
+                }
+                ChangeKind::Deleted => {
+                    let marker = div()
+                        .relative()
+                        .pl_4()
+                        .min_h(px(8.))
+                        .child(
+                            div()
+                                .id(("markdown-preview-deleted-change", key))
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .h_full()
+                                .w(px(12.))
+                                .cursor_pointer()
+                                .tooltip(Tooltip::text(if expanded.is_some() {
+                                    "Hide Deleted"
+                                } else {
+                                    "Show Deleted"
+                                }))
+                                .on_click(toggle(key))
+                                .child(div().h_full().w(px(4.)).bg(deleted_color).rounded_xs()),
+                        )
+                        .when_some(expanded, |this, expanded| {
+                            this.child(render_change_column(
+                                "Deleted",
+                                &expanded.before,
+                                deleted_color,
+                                markdown_style,
+                            ))
+                        })
+                        .into_any_element();
+                    if change.blocks.start < block_count {
+                        decorations.entry(change.blocks.start).or_default().before = Some(marker);
+                    } else if let Some(last_block) = block_count.checked_sub(1) {
+                        decorations.entry(last_block).or_default().after = Some(marker);
+                    }
+                }
+            }
+        }
+        decorations
     }
 
     fn selected_source_index(editor: &Editor, cx: &mut App) -> Option<usize> {
@@ -1106,6 +1425,7 @@ impl MarkdownPreviewView {
             MarkdownStyle::themed(MarkdownFont::Preview, window, cx)
         };
 
+        let change_decorations = self.change_decorations(&markdown_style, cx);
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
             .input_focus_handle(self.focus_handle.clone())
             .code_block_renderer(CodeBlockRenderer::Default {
@@ -1115,6 +1435,7 @@ impl MarkdownPreviewView {
             })
             .scroll_handle(self.scroll_handle.clone())
             .show_root_block_markers()
+            .root_block_decorations(change_decorations)
             .image_resolver({
                 let base_directory = self.base_directory.clone();
                 move |dest_url, cx| {
@@ -1846,6 +2167,67 @@ impl Item for MarkdownPreviewView {
     }
 }
 
+fn preview_markdown_options() -> MarkdownOptions {
+    MarkdownOptions {
+        parse_html: true,
+        render_mermaid_diagrams: true,
+        parse_heading_slugs: true,
+        render_metadata_blocks: true,
+        ..Default::default()
+    }
+}
+
+/// The committed text of a change, and its current text unless it was deleted.
+fn change_texts(
+    changes: &PreviewChanges,
+    change: &BlockChange,
+) -> (SharedString, Option<SharedString>) {
+    let before = changes
+        .old_text
+        .get(change.old_range.clone())
+        .unwrap_or_default();
+    let after = (change.kind == ChangeKind::Modified).then(|| {
+        changes
+            .source
+            .get(change.new_range.clone())
+            .unwrap_or_default()
+            .into()
+    });
+    (before.to_string().into(), after)
+}
+
+fn reset_markdown_source(markdown: &Entity<Markdown>, source: SharedString, cx: &mut App) {
+    markdown.update(cx, |markdown, cx| {
+        if markdown.source() != &source {
+            markdown.reset(source, cx);
+        }
+    });
+}
+
+fn render_change_column(
+    label: &'static str,
+    markdown: &Entity<Markdown>,
+    color: gpui::Hsla,
+    markdown_style: &MarkdownStyle,
+) -> impl IntoElement {
+    v_flex()
+        .flex_1()
+        .min_w(rems(14.))
+        .gap_1()
+        .p_2()
+        .rounded_sm()
+        .bg(color.opacity(0.1))
+        .child(
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(MarkdownElement::new(
+            markdown.clone(),
+            markdown_style.clone(),
+        ))
+}
+
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview_theme = self.resolve_preview_theme(cx);
@@ -1877,6 +2259,7 @@ impl Render for MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::increase_font_size))
             .on_action(cx.listener(MarkdownPreviewView::decrease_font_size))
             .on_action(cx.listener(MarkdownPreviewView::reset_font_size))
+            .on_action(cx.listener(MarkdownPreviewView::toggle_changes))
             .w_full()
             .flex_1()
             .min_h_0()
@@ -1964,6 +2347,21 @@ impl Render for MarkdownPreviewView {
                     .tracked_scroll_handle(&self.scroll_handle),
                 window,
                 cx,
+            )
+            .child(
+                div().absolute().top_2().right_4().child(
+                    IconButton::new("markdown-preview-toggle-changes", IconName::Diff)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(self.show_changes)
+                        .tooltip(Tooltip::text(if self.show_changes {
+                            "Hide Changes Since Last Commit"
+                        } else {
+                            "Show Changes Since Last Commit"
+                        }))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_changes(&ToggleChanges, window, cx);
+                        })),
+                ),
             )
             .when_some(hovered_url, |this, hovered_url| {
                 this.child(
@@ -3161,6 +3559,148 @@ mod tests {
                 .to_string()),
             "new\n"
         );
+    }
+
+    #[gpui::test]
+    async fn preview_shows_changes_since_last_commit(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                ".git": {},
+                "note.md": "# Title\n\nKept.\n\nNew text.\n"
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/dir/.git").as_ref(),
+            &[("note.md", "# Title\n\nGone.\n\nKept.\n\nOld text.\n".into())],
+        );
+
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/dir/note.md"))],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let preview = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    let editor: Entity<Editor> = workspace
+                        .active_item(cx)
+                        .and_then(|item| item.act_as::<Editor>(cx))
+                        .unwrap();
+                    let preview =
+                        MarkdownPreviewView::create_markdown_view(workspace, editor, window, cx);
+                    workspace.active_pane().update(cx, |pane, cx| {
+                        pane.add_item(Box::new(preview.clone()), true, true, None, window, cx)
+                    });
+                    preview
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                preview.update(cx, |preview, cx| {
+                    preview.toggle_changes(&crate::ToggleChanges, window, cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let changed_texts = |cx: &mut TestAppContext| {
+            preview.read_with(cx, |preview, _| {
+                let changes = preview.changes.as_ref().expect("changes should be loaded");
+                changes
+                    .block_changes
+                    .iter()
+                    .map(|change| {
+                        (
+                            change.kind,
+                            changes.old_text[change.old_range.clone()].to_string(),
+                            changes.source[change.new_range.clone()].to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            changed_texts(cx),
+            vec![
+                (
+                    crate::markdown_preview_diff::ChangeKind::Deleted,
+                    "Gone.\n".to_string(),
+                    String::new()
+                ),
+                (
+                    crate::markdown_preview_diff::ChangeKind::Modified,
+                    "Old text.\n".to_string(),
+                    "New text.\n".to_string()
+                ),
+            ]
+        );
+
+        let modified_key = preview.read_with(cx, |preview, _| {
+            preview.changes.as_ref().unwrap().block_changes[1]
+                .old_range
+                .start
+        });
+        preview.update(cx, |preview, cx| preview.toggle_change(modified_key, cx));
+        cx.run_until_parked();
+        let sources = |cx: &mut TestAppContext| {
+            preview.read_with(cx, |preview, cx| {
+                let expanded = &preview.changes.as_ref().unwrap().expanded[&modified_key];
+                (
+                    expanded.before.read(cx).source().to_string(),
+                    expanded
+                        .after
+                        .as_ref()
+                        .map(|after| after.read(cx).source().to_string()),
+                )
+            })
+        };
+        assert_eq!(
+            sources(cx),
+            ("Old text.\n".to_string(), Some("New text.\n".to_string()))
+        );
+
+        let editor = preview.read_with(cx, |preview, _| {
+            preview.active_editor.as_ref().unwrap().editor.clone()
+        });
+        cx.update(|cx| {
+            editor.update(cx, |editor, cx| {
+                let end = editor.buffer().read(cx).snapshot(cx).len();
+                editor.edit([(end - 1..end - 1, " More.")], cx);
+            });
+        });
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert_eq!(
+            sources(cx),
+            (
+                "Old text.\n".to_string(),
+                Some("New text. More.\n".to_string())
+            ),
+            "an expanded change follows edits of the buffer"
+        );
+
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                preview.update(cx, |preview, cx| {
+                    preview.toggle_changes(&crate::ToggleChanges, window, cx)
+                });
+            })
+            .unwrap();
+        assert!(preview.read_with(cx, |preview, _| preview.changes.is_none()));
     }
 
     #[gpui::test]

@@ -1,6 +1,7 @@
 use gpui::{App, actions};
 use workspace::Workspace;
 
+mod markdown_preview_diff;
 pub mod markdown_preview_settings;
 pub mod markdown_preview_view;
 
@@ -32,7 +33,9 @@ actions!(
         /// Opens a following markdown preview that syncs with the editor.
         OpenFollowingPreview,
         /// Closes the markdown preview and returns focus to the source editor.
-        CloseAndReturnToEditor
+        CloseAndReturnToEditor,
+        /// Shows or hides the changes since the last commit in the markdown preview.
+        ToggleChanges
     ]
 );
 
