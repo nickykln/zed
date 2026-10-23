@@ -88,6 +88,8 @@ pub struct TerminalPanel {
     deferred_tasks: HashMap<TaskId, Task<()>>,
     assistant_enabled: bool,
     active: bool,
+    /// Set once the saved terminals were deleted, so they are not saved again.
+    forgotten: bool,
 }
 
 impl TerminalPanel {
@@ -108,6 +110,7 @@ impl TerminalPanel {
             deferred_tasks: HashMap::default(),
             assistant_enabled: false,
             active: false,
+            forgotten: false,
         };
         terminal_panel.apply_tab_bar_buttons(&terminal_panel.active_pane, cx);
         terminal_panel
@@ -853,6 +856,27 @@ impl TerminalPanel {
         }
     }
 
+    /// Deletes the terminals saved for the workspace and stops saving them,
+    /// for a workspace closed for good: opening its folders again then starts
+    /// with no terminals instead of the shells of the previous sessions.
+    pub fn forget_saved_terminals(&mut self, cx: &mut Context<Self>) {
+        self.forgotten = true;
+        self.pending_serialization = Task::ready(None);
+        let Some(serialization_key) = self
+            .workspace
+            .read_with(cx, |workspace, _| {
+                TerminalPanel::serialization_key(workspace)
+            })
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move { kvp.delete_kvp(serialization_key).await })
+            .detach_and_log_err(cx);
+    }
+
     /// Whether the panel is still restoring its terminals from the previous
     /// session, which replaces its panes.
     pub fn is_restoring(&self) -> bool {
@@ -1197,7 +1221,7 @@ impl TerminalPanel {
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
-        if self.restoring {
+        if self.restoring || self.forgotten {
             return;
         }
         let Some(serialization_key) = self
@@ -2456,6 +2480,71 @@ mod tests {
         assert!(
             serialized_state.is_some(),
             "terminal added during restore must be serialized once restoration finishes"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_forget_saved_terminals(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        let serialization_key = window_handle
+            .update(cx, |multi_workspace, _, cx| {
+                TerminalPanel::serialization_key(multi_workspace.workspace().read(cx)).unwrap()
+            })
+            .unwrap();
+        let read_saved_state = |cx: &mut TestAppContext| {
+            cx.update(|cx| KeyValueStore::global(cx))
+                .read_kvp(&serialization_key)
+                .unwrap()
+        };
+
+        let terminal_panel = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    cx.new(|cx| TerminalPanel::new(workspace, window, cx))
+                })
+            })
+            .unwrap();
+        let add_shell = |cx: &mut TestAppContext| {
+            window_handle
+                .update(cx, |_, window, cx| {
+                    terminal_panel.update(cx, |terminal_panel, cx| {
+                        terminal_panel.add_terminal_shell(
+                            false,
+                            None,
+                            RevealStrategy::Never,
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .unwrap()
+        };
+
+        add_shell(cx).await.unwrap();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(read_saved_state(cx).is_some());
+
+        terminal_panel.update(cx, |terminal_panel, cx| {
+            terminal_panel.forget_saved_terminals(cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(read_saved_state(cx), None);
+
+        add_shell(cx).await.unwrap();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert_eq!(
+            read_saved_state(cx),
+            None,
+            "terminals must not be saved again once forgotten"
         );
     }
 

@@ -5562,6 +5562,13 @@ impl Sidebar {
             return;
         }
 
+        // These workspaces are closed for good, as their worktrees are
+        // archived, so the shells of their terminal panels must not come back
+        // when a later session opens the same folders.
+        let terminal_panels = workspaces_to_remove
+            .iter()
+            .filter_map(|workspace| workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx))
+            .collect::<Vec<_>>();
         let remove_task = if workspaces_to_remove.is_empty() {
             None
         } else {
@@ -5579,6 +5586,13 @@ impl Sidebar {
             {
                 return anyhow::Ok(());
             }
+            cx.update(|_, cx| {
+                for terminal_panel in terminal_panels {
+                    terminal_panel.update(cx, |terminal_panel, cx| {
+                        terminal_panel.forget_saved_terminals(cx)
+                    });
+                }
+            })?;
 
             for task in close_item_tasks {
                 let result: anyhow::Result<()> = task.await;
