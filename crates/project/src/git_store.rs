@@ -7270,6 +7270,15 @@ impl Repository {
             }
         });
 
+        self.reload_git_state(cx);
+
+        receiver
+    }
+
+    /// Reloads the branch, the statuses and the rest of the git state of a
+    /// local repository, for changes made by another process that the file
+    /// watcher may have missed.
+    pub fn reload_git_state(&mut self, cx: &mut Context<Self>) {
         let scan_updates_tx =
             self.git_store()
                 .and_then(|git_store| match &git_store.read(cx).state {
@@ -7283,8 +7292,6 @@ impl Repository {
         if let Some(updates_tx) = scan_updates_tx {
             self.schedule_scan(updates_tx, cx);
         }
-
-        receiver
     }
 
     pub fn show(&mut self, commit: String) -> oneshot::Receiver<Result<CommitDetails>> {

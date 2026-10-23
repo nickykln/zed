@@ -853,6 +853,61 @@ impl TerminalPanel {
         }
     }
 
+    /// Whether the panel is still restoring its terminals from the previous
+    /// session, which replaces its panes.
+    pub fn is_restoring(&self) -> bool {
+        self.restoring
+    }
+
+    /// Takes the terminal still running the task with this label out of its
+    /// pane without stopping it, along with its tab title, so that it can be
+    /// added to the panel of another workspace.
+    pub fn take_running_task_terminal(
+        &mut self,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<Terminal>, Option<String>)> {
+        let (_, pane, terminal_view) = self.running_task_terminal(label, cx)?;
+        let item_id = terminal_view.entity_id();
+        let terminal_view = terminal_view.read(cx);
+        let terminal = terminal_view.terminal().clone();
+        let custom_title = terminal_view.custom_title().map(ToString::to_string);
+        pane.update(cx, |pane, cx| {
+            pane.remove_item(item_id, false, true, window, cx);
+        });
+        Some((terminal, custom_title))
+    }
+
+    /// Adds a terminal taken from the panel of another workspace with
+    /// [`Self::take_running_task_terminal`].
+    pub fn add_moved_terminal(
+        &mut self,
+        terminal: Entity<Terminal>,
+        custom_title: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let workspace = self
+            .workspace
+            .upgrade()
+            .ok_or_else(|| anyhow!("the workspace of the terminal panel was closed"))?;
+        let workspace = workspace.read(cx);
+        let workspace_id = workspace.database_id();
+        let project = workspace.project().downgrade();
+        let weak_workspace = self.workspace.clone();
+        let terminal_view = cx.new(|cx| {
+            let mut terminal_view =
+                TerminalView::new(terminal, weak_workspace, workspace_id, project, window, cx);
+            terminal_view.set_custom_title(custom_title, cx);
+            terminal_view
+        });
+        self.active_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(terminal_view), true, true, None, window, cx);
+        });
+        Ok(())
+    }
+
     fn running_task_terminal(
         &self,
         label: &str,

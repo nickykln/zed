@@ -3,11 +3,11 @@ use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::AgentSettings;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, Entity, Global, Subscription, TaskExt as _, WeakEntity,
-    Window, WindowHandle,
+    AnyWindowHandle, App, AppContext as _, AsyncApp, Entity, Global, Subscription, TaskExt as _,
+    WeakEntity, Window, WindowHandle,
 };
 use project::AgentId;
 use settings::{NotifyWhenAgentWaiting, Settings as _};
@@ -15,7 +15,7 @@ use task::{HideStrategy, RevealStrategy, RevealTarget, Shell, SpawnInTerminal, T
 use terminal_view::terminal_panel::{self, TerminalPanel};
 use ui::{AgentThreadStatus, IconName};
 use util::ResultExt as _;
-use workspace::{MultiWorkspace, Pane, PathList, Workspace};
+use workspace::{MultiWorkspace, OpenMode, Pane, PathList, Workspace};
 
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
@@ -25,6 +25,8 @@ const ENTER_DELAY: Duration = Duration::from_millis(500);
 const CODEX_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TERMINAL_START_TIMEOUT: Duration = Duration::from_secs(30);
+const TERMINAL_PANEL_LOAD_ATTEMPTS: usize = 100;
+const TERMINAL_PANEL_LOAD_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Agents that ship a command line client which can run in the terminal panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +278,9 @@ pub struct CliSessions {
     watched_statuses: HashSet<acp_v2::SessionId>,
     /// Latest status reported by the hooks of each running session.
     statuses: HashMap<acp_v2::SessionId, AgentThreadStatus>,
+    /// Terminal panels that running sessions moved to when they followed
+    /// their working directory into another git worktree.
+    moved_terminal_panels: HashMap<acp_v2::SessionId, WeakEntity<TerminalPanel>>,
     /// Pop-ups telling that a session waits for the user.
     notifications: HashMap<acp_v2::SessionId, SessionNotification>,
 }
@@ -293,6 +298,19 @@ pub fn session_status(session_id: &acp_v2::SessionId, cx: &App) -> Option<AgentT
         .statuses
         .get(session_id)
         .copied()
+}
+
+/// Terminal panel the session runs in: `started_in`, unless the session moved
+/// to another git worktree since.
+fn session_terminal_panel(
+    session_id: &acp_v2::SessionId,
+    started_in: &WeakEntity<TerminalPanel>,
+    cx: &App,
+) -> WeakEntity<TerminalPanel> {
+    cx.try_global::<CliSessions>()
+        .and_then(|sessions| sessions.moved_terminal_panels.get(session_id))
+        .unwrap_or(started_in)
+        .clone()
 }
 
 /// Session run by the terminal shown in the active tab of `pane`.
@@ -655,7 +673,7 @@ fn watch_session_title(
                 ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                     store.set_generated_title(thread_id, title.clone().into(), cx)
                 });
-                terminal_panel
+                session_terminal_panel(&session_id, &terminal_panel, cx)
                     .update(cx, |terminal_panel, cx| {
                         for label in &terminal_labels {
                             terminal_panel.set_task_terminal_title(label, &title, cx);
@@ -869,11 +887,12 @@ fn watch_session_status(
     cx.spawn(async move |cx| {
         let mut terminal_was_running = false;
         let mut last_modified = None;
+        let mut last_working_directory = None;
         loop {
             cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
 
             let terminal_is_running = cx.update(|cx| {
-                terminal_panel
+                session_terminal_panel(&session_id, &terminal_panel, cx)
                     .update(cx, |terminal_panel, cx| {
                         terminal_labels
                             .iter()
@@ -915,6 +934,29 @@ fn watch_session_status(
                 continue;
             };
             last_modified = modified;
+            if let Some(working_directory) = hook_input
+                .get("cwd")
+                .and_then(|working_directory| working_directory.as_str())
+                && last_working_directory.as_deref() != Some(working_directory)
+            {
+                last_working_directory = Some(working_directory.to_string());
+                follow_session_to_worktree(
+                    &session_id,
+                    &terminal_labels,
+                    &terminal_panel,
+                    window,
+                    Path::new(working_directory),
+                    cx,
+                )
+                .await
+                .log_err();
+            }
+            if may_change_git_state(&hook_input) {
+                cx.update(|cx| {
+                    let terminal_panel = session_terminal_panel(&session_id, &terminal_panel, cx);
+                    reload_git_state(&terminal_panel, window, cx);
+                });
+            }
             let Some(status) = status_from_hook_input(&hook_input) else {
                 continue;
             };
@@ -929,7 +971,7 @@ fn watch_session_status(
                         previous_status,
                         status,
                         &terminal_labels,
-                        &terminal_panel,
+                        &session_terminal_panel(&session_id, &terminal_panel, cx),
                         window,
                         cx,
                     );
@@ -940,10 +982,248 @@ fn watch_session_status(
             let sessions = cx.default_global::<CliSessions>();
             sessions.watched_statuses.remove(&session_id);
             sessions.statuses.remove(&session_id);
+            sessions.moved_terminal_panels.remove(&session_id);
             dismiss_session_notification(&session_id, cx);
         });
     })
     .detach();
+}
+
+/// Whether the last hook a session ran tells that it may have changed the git
+/// state, like checking out another branch with a shell command. Only the last
+/// hook is seen, so the end of each turn is included in case the hook of the
+/// command was missed.
+fn may_change_git_state(hook_input: &serde_json::Value) -> bool {
+    let field = |key: &str| hook_input.get(key).and_then(|value| value.as_str());
+    match field("hook_event_name") {
+        Some("PostToolUse") => field("tool_name") == Some("Bash"),
+        Some("Stop") => true,
+        _ => false,
+    }
+}
+
+/// Reloads the git state of the workspace a session runs in, since the file
+/// watcher can miss the changes the session makes, like a checkout.
+fn reload_git_state(
+    terminal_panel: &WeakEntity<TerminalPanel>,
+    window: AnyWindowHandle,
+    cx: &mut App,
+) {
+    let Some(window) = window.downcast::<MultiWorkspace>() else {
+        return;
+    };
+    window
+        .update(cx, |multi_workspace, _, cx| {
+            let Some(workspace) = workspace_of_terminal_panel(multi_workspace, terminal_panel, cx)
+            else {
+                return;
+            };
+            let repositories = workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .repositories(cx)
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for repository in repositories {
+                repository.update(cx, |repository, cx| repository.reload_git_state(cx));
+            }
+        })
+        .log_err();
+}
+
+/// Root and common git directory of the git worktree containing a path.
+#[derive(Debug, PartialEq)]
+struct GitWorktree {
+    root: PathBuf,
+    common_directory: PathBuf,
+}
+
+impl GitWorktree {
+    /// `None` when the path isn't in a git repository.
+    async fn containing(path: &Path) -> Result<Option<Self>> {
+        let output = util::command::new_command("git")
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--git-common-dir",
+            ])
+            .current_dir(path)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Self::parse(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    fn parse(rev_parse_output: &str) -> Option<Self> {
+        let mut lines = rev_parse_output.lines();
+        Some(Self {
+            root: PathBuf::from(lines.next()?),
+            common_directory: PathBuf::from(lines.next()?),
+        })
+    }
+
+    /// Root of the main worktree of the repository, which is where the
+    /// common git directory lives unless the repository is bare.
+    fn main_root(&self) -> PathBuf {
+        match self.common_directory.file_name() {
+            Some(name) if name == ".git" => self
+                .common_directory
+                .parent()
+                .map_or_else(|| self.common_directory.clone(), Path::to_path_buf),
+            _ => self.common_directory.clone(),
+        }
+    }
+}
+
+/// Follows a Claude session whose working directory moved to another git
+/// worktree of the same repository, like with its `EnterWorktree` tool: opens
+/// the workspace of that worktree, moves the session's terminal to its
+/// terminal panel and files the thread under that worktree.
+async fn follow_session_to_worktree(
+    session_id: &acp_v2::SessionId,
+    terminal_labels: &[String],
+    started_in: &WeakEntity<TerminalPanel>,
+    window: AnyWindowHandle,
+    working_directory: &Path,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let Some(window) = window.downcast::<MultiWorkspace>() else {
+        return Ok(());
+    };
+    let terminal_panel = cx.update(|cx| session_terminal_panel(session_id, started_in, cx));
+    let source_workspace = window.update(cx, |multi_workspace, _, cx| {
+        let workspace = workspace_of_terminal_panel(multi_workspace, &terminal_panel, cx)?;
+        workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .is_local()
+            .then_some(workspace)
+    })?;
+    let Some(source_workspace) = source_workspace else {
+        return Ok(());
+    };
+    let Some(target) = GitWorktree::containing(working_directory).await? else {
+        return Ok(());
+    };
+    let root_paths = source_workspace.read_with(cx, |workspace, cx| workspace.root_paths(cx));
+    let mut source_worktrees = Vec::new();
+    for root_path in root_paths {
+        if let Some(worktree) = GitWorktree::containing(&root_path)
+            .await
+            .log_err()
+            .flatten()
+        {
+            source_worktrees.push(worktree);
+        }
+    }
+    let already_there = source_worktrees
+        .iter()
+        .any(|worktree| worktree.root == target.root);
+    let same_repository = source_worktrees
+        .iter()
+        .any(|worktree| worktree.common_directory == target.common_directory);
+    if already_there || !same_repository {
+        return Ok(());
+    }
+
+    let target_paths = PathList::new(std::slice::from_ref(&target.root));
+    let target_workspace = window
+        .update(cx, |multi_workspace, window, cx| {
+            let project_group_key = source_workspace.read(cx).project_group_key(cx);
+            multi_workspace.find_or_create_local_workspace(
+                target_paths.clone(),
+                Some(project_group_key),
+                None,
+                OpenMode::Activate,
+                Some(source_workspace.downgrade()),
+                window,
+                cx,
+            )
+        })?
+        .await?;
+
+    // A new workspace loads its panels asynchronously, and its terminal panel
+    // then restores the previous terminals by replacing its panes, which would
+    // drop a terminal added in the meantime.
+    let mut target_terminal_panel = None;
+    for _ in 0..TERMINAL_PANEL_LOAD_ATTEMPTS {
+        target_terminal_panel = target_workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .panel::<TerminalPanel>(cx)
+                .filter(|terminal_panel| !terminal_panel.read(cx).is_restoring())
+        });
+        if target_terminal_panel.is_some() {
+            break;
+        }
+        cx.background_executor()
+            .timer(TERMINAL_PANEL_LOAD_INTERVAL)
+            .await;
+    }
+    let target_terminal_panel = target_terminal_panel
+        .ok_or_else(|| anyhow!("the terminal panel of the worktree workspace did not load"))?;
+
+    let moved = window.update(cx, |_, window, cx| {
+        let Some(terminal_panel) = terminal_panel.upgrade() else {
+            return Ok(false);
+        };
+        let taken = terminal_panel.update(cx, |terminal_panel, cx| {
+            terminal_labels
+                .iter()
+                .find_map(|label| terminal_panel.take_running_task_terminal(label, window, cx))
+        });
+        let Some((terminal, custom_title)) = taken else {
+            return Ok(false);
+        };
+        target_terminal_panel.update(cx, |terminal_panel, cx| {
+            terminal_panel.add_moved_terminal(terminal, custom_title, window, cx)
+        })?;
+        target_workspace.update(cx, |workspace, cx| {
+            workspace.focus_panel::<TerminalPanel>(window, cx);
+        });
+        anyhow::Ok(true)
+    })??;
+    if !moved {
+        return Ok(());
+    }
+
+    cx.update(|cx| {
+        cx.default_global::<CliSessions>()
+            .moved_terminal_panels
+            .insert(session_id.clone(), target_terminal_panel.downgrade());
+        let main_paths = PathList::new(&[target.main_root()]);
+        let worktree_paths = WorktreePaths::from_path_lists(main_paths, target_paths)?;
+        let store = ThreadMetadataStore::global(cx);
+        let thread_id = store
+            .read(cx)
+            .entry_by_session(session_id)
+            .map(|metadata| metadata.thread_id);
+        if let Some(thread_id) = thread_id {
+            store.update(cx, |store, cx| {
+                store.update_worktree_paths(&[thread_id], worktree_paths, cx);
+            });
+        }
+        anyhow::Ok(())
+    })
+}
+
+fn workspace_of_terminal_panel(
+    multi_workspace: &MultiWorkspace,
+    terminal_panel: &WeakEntity<TerminalPanel>,
+    cx: &App,
+) -> Option<Entity<Workspace>> {
+    let terminal_panel = terminal_panel.upgrade()?;
+    multi_workspace
+        .workspaces()
+        .find(|workspace| {
+            workspace.read(cx).panel::<TerminalPanel>(cx).as_ref() == Some(&terminal_panel)
+        })
+        .cloned()
 }
 
 /// Tells the user that a session waits for them, the way the agent panel does
@@ -1088,12 +1368,8 @@ fn show_session_terminal(
     window
         .update(cx, |multi_workspace, window, cx| {
             window.activate_window();
-            let workspace = multi_workspace
-                .workspaces()
-                .find(|workspace| {
-                    workspace.read(cx).panel::<TerminalPanel>(cx).as_ref() == Some(&terminal_panel)
-                })
-                .cloned();
+            let workspace =
+                workspace_of_terminal_panel(multi_workspace, &terminal_panel.downgrade(), cx);
             if let Some(workspace) = workspace {
                 multi_workspace.activate(workspace, None, window, cx);
             }
@@ -1269,5 +1545,40 @@ mod tests {
             status(serde_json::json!({ "hook_event_name": "Stop" })),
             Some(AgentThreadStatus::Completed)
         );
+    }
+
+    #[test]
+    fn test_git_worktree() {
+        let linked = GitWorktree::parse("/repo/.claude/worktrees/feature\n/repo/.git\n")
+            .expect("both paths are printed");
+        assert_eq!(
+            linked.root,
+            PathBuf::from("/repo/.claude/worktrees/feature")
+        );
+        assert_eq!(linked.main_root(), PathBuf::from("/repo"));
+
+        let bare =
+            GitWorktree::parse("/worktrees/feature\n/repo.git\n").expect("both paths are printed");
+        assert_eq!(bare.main_root(), PathBuf::from("/repo.git"));
+
+        assert_eq!(GitWorktree::parse(""), None);
+    }
+
+    #[test]
+    fn test_may_change_git_state() {
+        let changes = |hook_input: serde_json::Value| may_change_git_state(&hook_input);
+        assert!(changes(serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+        })));
+        assert!(changes(serde_json::json!({ "hook_event_name": "Stop" })));
+        assert!(!changes(serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+        })));
+        assert!(!changes(serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+        })));
     }
 }
