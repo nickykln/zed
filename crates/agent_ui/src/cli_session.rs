@@ -6,8 +6,8 @@ use agent_settings::AgentSettings;
 use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, AsyncApp, Entity, Global, Subscription, TaskExt as _,
-    WeakEntity, Window, WindowHandle,
+    AnyWindowHandle, App, AppContext as _, AsyncApp, Entity, Global, SharedString, Subscription,
+    TaskExt as _, WeakEntity, Window, WindowHandle,
 };
 use project::AgentId;
 use settings::{NotifyWhenAgentWaiting, Settings as _};
@@ -15,7 +15,8 @@ use task::{HideStrategy, RevealStrategy, RevealTarget, Shell, SpawnInTerminal, T
 use terminal_view::terminal_panel::{self, TerminalPanel};
 use ui::{AgentThreadStatus, IconName};
 use util::ResultExt as _;
-use workspace::{MultiWorkspace, OpenMode, Pane, PathList, Workspace};
+use workspace::notifications::NotificationId;
+use workspace::{MultiWorkspace, OpenMode, Pane, PathList, Toast, Workspace};
 
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
@@ -27,6 +28,7 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TERMINAL_START_TIMEOUT: Duration = Duration::from_secs(30);
 const TERMINAL_PANEL_LOAD_ATTEMPTS: usize = 100;
 const TERMINAL_PANEL_LOAD_INTERVAL: Duration = Duration::from_millis(100);
+const TOOL_USES_BEFORE_FOLLOWING_WORK: usize = 3;
 
 /// Agents that ship a command line client which can run in the terminal panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,9 +280,11 @@ pub struct CliSessions {
     watched_statuses: HashSet<acp_v2::SessionId>,
     /// Latest status reported by the hooks of each running session.
     statuses: HashMap<acp_v2::SessionId, AgentThreadStatus>,
-    /// Terminal panels that running sessions moved to when they followed
-    /// their working directory into another git worktree.
-    moved_terminal_panels: HashMap<acp_v2::SessionId, WeakEntity<TerminalPanel>>,
+    /// Terminal panel each session whose status is polled runs in, which
+    /// changes when it follows its work into another git worktree.
+    running_terminal_panels: HashMap<acp_v2::SessionId, WeakEntity<TerminalPanel>>,
+    /// Last branch seen in the git worktrees sessions run in.
+    worktree_branches: HashMap<PathBuf, String>,
     /// Pop-ups telling that a session waits for the user.
     notifications: HashMap<acp_v2::SessionId, SessionNotification>,
 }
@@ -308,7 +312,7 @@ fn session_terminal_panel(
     cx: &App,
 ) -> WeakEntity<TerminalPanel> {
     cx.try_global::<CliSessions>()
-        .and_then(|sessions| sessions.moved_terminal_panels.get(session_id))
+        .and_then(|sessions| sessions.running_terminal_panels.get(session_id))
         .unwrap_or(started_in)
         .clone()
 }
@@ -805,22 +809,32 @@ fn status_file(session_id: &acp_v2::SessionId) -> PathBuf {
     status_directory().join(format!("{session_id}.status.json"))
 }
 
+fn hook_log_file(session_id: &acp_v2::SessionId) -> PathBuf {
+    status_directory().join(format!("{session_id}.hooks.jsonl"))
+}
+
 /// Writes Claude settings whose hooks copy each hook input to the session's
-/// status file, and returns their path. A stale status file is removed, so
-/// the new session starts out as idle.
+/// status file and append it to its hook log, and returns their path. Stale
+/// files are removed, so the new session starts out as idle.
 fn write_claude_status_settings(session_id: &acp_v2::SessionId) -> Result<PathBuf> {
     let directory = status_directory();
     std::fs::create_dir_all(&directory)?;
     let status_file = status_file(session_id);
-    if let Err(error) = std::fs::remove_file(&status_file)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(error.into());
+    let hook_log_file = hook_log_file(session_id);
+    for file in [&status_file, &hook_log_file] {
+        if let Err(error) = std::fs::remove_file(file)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
     }
-    let quoted_status_file = format!("'{}'", status_file.to_string_lossy().replace('\'', "'\\''"));
+    let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
     let hook = serde_json::json!([{
         "matcher": "*",
-        "hooks": [{ "type": "command", "command": format!("cat > {quoted_status_file}") }],
+        "hooks": [{
+            "type": "command",
+            "command": format!("tee -a {} > {}", quote(&hook_log_file), quote(&status_file)),
+        }],
     }]);
     let settings = serde_json::json!({
         "hooks": {
@@ -882,12 +896,18 @@ fn watch_session_status(
     {
         return;
     }
+    cx.default_global::<CliSessions>()
+        .running_terminal_panels
+        .insert(session_id.clone(), terminal_panel.clone());
     let status_file = status_file(&session_id);
+    let hook_log_file = hook_log_file(&session_id);
     let started_at = SystemTime::now();
     cx.spawn(async move |cx| {
         let mut terminal_was_running = false;
         let mut last_modified = None;
         let mut last_working_directory = None;
+        let mut hook_log_offset = 0;
+        let mut work_location = WorkLocation::default();
         loop {
             cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
 
@@ -907,6 +927,58 @@ fn watch_session_status(
             {
                 break;
             }
+
+            let (hook_inputs, read_up_to) = cx
+                .background_executor()
+                .spawn({
+                    let hook_log_file = hook_log_file.clone();
+                    async move { read_hook_log(&hook_log_file, hook_log_offset) }
+                })
+                .await;
+            hook_log_offset = read_up_to;
+            for hook_input in hook_inputs {
+                let work_path = work_path_from_hook_input(&hook_input);
+                let working_directory = hook_input
+                    .get("cwd")
+                    .and_then(|working_directory| working_directory.as_str())
+                    .filter(|_| !work_location.knows_current_root())
+                    .map(PathBuf::from);
+                if work_path.is_none() && working_directory.is_none() {
+                    continue;
+                }
+                let (work_root, working_root) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        (
+                            work_path.and_then(|path| git_worktree_root(&path)),
+                            working_directory.and_then(|path| git_worktree_root(&path)),
+                        )
+                    })
+                    .await;
+                if let Some(working_root) = working_root {
+                    work_location.moved_to(working_root);
+                }
+                let Some(work_root) = work_root else {
+                    continue;
+                };
+                if work_location.should_follow(&work_root) {
+                    follow_session_to_worktree(
+                        &session_id,
+                        &terminal_labels,
+                        &terminal_panel,
+                        window,
+                        &work_root,
+                        cx,
+                    )
+                    .await
+                    .log_err();
+                    work_location.moved_to(work_root);
+                }
+            }
+            cx.update(|cx| {
+                let terminal_panel = session_terminal_panel(&session_id, &terminal_panel, cx);
+                warn_on_shared_worktree_branch_change(&terminal_panel, window, cx);
+            });
 
             let (modified, hook_input) = cx
                 .background_executor()
@@ -950,6 +1022,14 @@ fn watch_session_status(
                 )
                 .await
                 .log_err();
+                let working_directory = PathBuf::from(working_directory);
+                let working_root = cx
+                    .background_executor()
+                    .spawn(async move { git_worktree_root(&working_directory) })
+                    .await;
+                if let Some(working_root) = working_root {
+                    work_location.moved_to(working_root);
+                }
             }
             if may_change_git_state(&hook_input) {
                 cx.update(|cx| {
@@ -982,7 +1062,7 @@ fn watch_session_status(
             let sessions = cx.default_global::<CliSessions>();
             sessions.watched_statuses.remove(&session_id);
             sessions.statuses.remove(&session_id);
-            sessions.moved_terminal_panels.remove(&session_id);
+            sessions.running_terminal_panels.remove(&session_id);
             dismiss_session_notification(&session_id, cx);
         });
     })
@@ -1029,6 +1109,214 @@ fn reload_git_state(
             for repository in repositories {
                 repository.update(cx, |repository, cx| repository.reload_git_state(cx));
             }
+        })
+        .log_err();
+}
+
+/// Reads the hook inputs appended to a session's hook log from `offset` on,
+/// and returns them with the offset to read from next. A hook may still be
+/// writing its input, which is then read again on the next call.
+fn read_hook_log(hook_log_file: &Path, offset: usize) -> (Vec<serde_json::Value>, usize) {
+    let Ok(contents) = std::fs::read(hook_log_file) else {
+        return (Vec::new(), offset);
+    };
+    let Some(new_contents) = contents.get(offset..) else {
+        return (Vec::new(), offset);
+    };
+    let (hook_inputs, consumed) = parse_hook_log(new_contents);
+    (hook_inputs, offset + consumed)
+}
+
+/// Parses the complete hook inputs at the start of `contents`, and returns
+/// them with the number of bytes they span. Claude writes each input as one
+/// JSON value, not always followed by a newline.
+fn parse_hook_log(contents: &[u8]) -> (Vec<serde_json::Value>, usize) {
+    let mut stream = serde_json::Deserializer::from_slice(contents).into_iter();
+    let mut hook_inputs = Vec::new();
+    let mut consumed = 0;
+    loop {
+        match stream.next() {
+            Some(Ok(hook_input)) => {
+                hook_inputs.push(hook_input);
+                consumed = stream.byte_offset();
+            }
+            Some(Err(error)) if error.is_eof() => break,
+            // Garbage would block the log forever, so it is skipped.
+            Some(Err(_)) => {
+                consumed = contents.len();
+                break;
+            }
+            None => break,
+        }
+    }
+    (hook_inputs, consumed)
+}
+
+/// Path a tool use shows the session works in: the file an editing tool
+/// changed, or the directory a shell command first moves to. A session can
+/// work in another git worktree than its working directory, by starting each
+/// shell command with `cd`.
+fn work_path_from_hook_input(hook_input: &serde_json::Value) -> Option<PathBuf> {
+    let field = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+    };
+    if field(hook_input, "hook_event_name")? != "PostToolUse" {
+        return None;
+    }
+    let tool_input = hook_input.get("tool_input")?;
+    let path = match field(hook_input, "tool_name")?.as_str() {
+        "Edit" | "MultiEdit" | "Write" => field(tool_input, "file_path")?,
+        "NotebookEdit" => field(tool_input, "notebook_path")?,
+        "Bash" => leading_cd_directory(&field(tool_input, "command")?)?,
+        _ => return None,
+    };
+    let path = match path.strip_prefix("~/") {
+        Some(path_in_home) => paths::home_dir().join(path_in_home),
+        None => PathBuf::from(path),
+    };
+    if path.is_absolute() {
+        return Some(path);
+    }
+    Some(PathBuf::from(field(hook_input, "cwd")?).join(path))
+}
+
+/// Directory a shell command starts by moving to, like in
+/// `cd /repo/.worktrees/feature && cargo test`.
+fn leading_cd_directory(command: &str) -> Option<String> {
+    let arguments = command.trim_start().strip_prefix("cd ")?.trim_start();
+    let directory = match arguments.chars().next()? {
+        quote @ ('\'' | '"') => arguments[1..].split(quote).next()?,
+        _ => arguments
+            .split(|character: char| character.is_whitespace() || "&;|".contains(character))
+            .next()?,
+    };
+    (!directory.is_empty()).then(|| directory.to_string())
+}
+
+/// Root of the git worktree containing a path: the closest directory with a
+/// `.git` entry, which is a file in linked worktrees. It is canonicalized, as
+/// shell commands reach the same worktree through paths like `../feature`.
+fn git_worktree_root(path: &Path) -> Option<PathBuf> {
+    let root = path
+        .ancestors()
+        .find(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok())?;
+    Some(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
+}
+
+/// Where a session works, followed from its tool uses. It is only followed
+/// into another git worktree after several tool uses in a row happened there,
+/// so that a session glancing at another worktree doesn't move back and forth.
+#[derive(Default)]
+struct WorkLocation {
+    current_root: Option<PathBuf>,
+    candidate_root: Option<PathBuf>,
+    candidate_tool_uses: usize,
+}
+
+impl WorkLocation {
+    fn knows_current_root(&self) -> bool {
+        self.current_root.is_some()
+    }
+
+    fn should_follow(&mut self, root: &Path) -> bool {
+        if self.current_root.as_deref() == Some(root) {
+            self.candidate_root = None;
+            self.candidate_tool_uses = 0;
+            return false;
+        }
+        if self.candidate_root.as_deref() == Some(root) {
+            self.candidate_tool_uses += 1;
+        } else {
+            self.candidate_root = Some(root.to_path_buf());
+            self.candidate_tool_uses = 1;
+        }
+        self.candidate_tool_uses >= TOOL_USES_BEFORE_FOLLOWING_WORK
+    }
+
+    fn moved_to(&mut self, root: PathBuf) {
+        self.current_root = Some(root);
+        self.candidate_root = None;
+        self.candidate_tool_uses = 0;
+    }
+}
+
+/// Warns when the branch of a git worktree changes while several sessions run
+/// in it: a session checking out another branch changes it under the others,
+/// which go on as if nothing happened.
+fn warn_on_shared_worktree_branch_change(
+    terminal_panel: &WeakEntity<TerminalPanel>,
+    window: AnyWindowHandle,
+    cx: &mut App,
+) {
+    let Some(window) = window.downcast::<MultiWorkspace>() else {
+        return;
+    };
+    window
+        .update(cx, |multi_workspace, _, cx| {
+            let Some(workspace) = workspace_of_terminal_panel(multi_workspace, terminal_panel, cx)
+            else {
+                return;
+            };
+            let Some(repository) = workspace.read(cx).project().read(cx).active_repository(cx)
+            else {
+                return;
+            };
+            let repository = repository.read(cx);
+            let Some(branch) = repository
+                .branch
+                .as_ref()
+                .map(|branch| branch.name().to_string())
+            else {
+                return;
+            };
+            let root = repository.work_directory_abs_path.to_path_buf();
+            let sessions = cx.default_global::<CliSessions>();
+            let previous_branch = sessions
+                .worktree_branches
+                .insert(root.clone(), branch.clone());
+            let Some(previous_branch) = previous_branch.filter(|previous| *previous != branch)
+            else {
+                return;
+            };
+            let terminal_panels = sessions
+                .running_terminal_panels
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let session_count = terminal_panels
+                .iter()
+                .filter(|terminal_panel| {
+                    workspace_of_terminal_panel(multi_workspace, terminal_panel, cx).as_ref()
+                        == Some(&workspace)
+                })
+                .count();
+            if session_count < 2 {
+                return;
+            }
+            let worktree_name = root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.to_string_lossy().into_owned());
+            struct SharedWorktreeBranchToast;
+            let toast = Toast::new(
+                NotificationId::composite::<SharedWorktreeBranchToast>(SharedString::from(
+                    root.to_string_lossy().into_owned(),
+                )),
+                format!(
+                    "{session_count} Claude sessions run in the worktree {worktree_name}, \
+                     and its branch changed from {previous_branch} to {branch}. \
+                     The other sessions may still expect {previous_branch}."
+                ),
+            );
+            multi_workspace
+                .workspace()
+                .clone()
+                .update(cx, |workspace, cx| {
+                    workspace.show_toast(toast, cx);
+                });
         })
         .log_err();
 }
@@ -1194,7 +1482,7 @@ async fn follow_session_to_worktree(
 
     cx.update(|cx| {
         cx.default_global::<CliSessions>()
-            .moved_terminal_panels
+            .running_terminal_panels
             .insert(session_id.clone(), target_terminal_panel.downgrade());
         let main_paths = PathList::new(&[target.main_root()]);
         let worktree_paths = WorktreePaths::from_path_lists(main_paths, target_paths)?;
@@ -1580,5 +1868,93 @@ mod tests {
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
         })));
+    }
+
+    #[test]
+    fn test_parse_hook_log() {
+        let contents = b"{\"a\":1}\n{\"b\":\n2}{\"c\":";
+        let (hook_inputs, consumed) = parse_hook_log(contents);
+        assert_eq!(
+            hook_inputs,
+            vec![serde_json::json!({ "a": 1 }), serde_json::json!({ "b": 2 })]
+        );
+        assert_eq!(&contents[consumed..], b"{\"c\":");
+
+        let (hook_inputs, consumed) = parse_hook_log(b"]garbage");
+        assert!(hook_inputs.is_empty());
+        assert_eq!(consumed, 8);
+    }
+
+    #[test]
+    fn test_leading_cd_directory() {
+        assert_eq!(
+            leading_cd_directory("cd /repo/.worktrees/doe && uv run pytest"),
+            Some("/repo/.worktrees/doe".to_string())
+        );
+        assert_eq!(
+            leading_cd_directory("  cd '/repo/my worktree'; ls"),
+            Some("/repo/my worktree".to_string())
+        );
+        assert_eq!(
+            leading_cd_directory("cd ../other|cat"),
+            Some("../other".to_string())
+        );
+        assert_eq!(leading_cd_directory("git status"), None);
+        assert_eq!(leading_cd_directory("cd "), None);
+    }
+
+    #[test]
+    fn test_work_path_from_hook_input() {
+        let work_path = |hook_input: serde_json::Value| work_path_from_hook_input(&hook_input);
+        assert_eq!(
+            work_path(serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": "/repo/.worktrees/doe/src/main.py" },
+            })),
+            Some(PathBuf::from("/repo/.worktrees/doe/src/main.py"))
+        );
+        assert_eq!(
+            work_path(serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "cwd": "/repo/.worktrees/batch",
+                "tool_input": { "command": "cd ../doe && pytest" },
+            })),
+            Some(PathBuf::from("/repo/.worktrees/batch/../doe"))
+        );
+        assert_eq!(
+            work_path(serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": "/repo/src/main.py" },
+            })),
+            None
+        );
+        assert_eq!(
+            work_path(serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": { "file_path": "/repo/src/main.py" },
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn test_work_location() {
+        let mut work_location = WorkLocation::default();
+        work_location.moved_to(PathBuf::from("/repo/batch"));
+        let other = Path::new("/repo/doe");
+
+        assert!(!work_location.should_follow(other));
+        assert!(!work_location.should_follow(other));
+        assert!(!work_location.should_follow(Path::new("/repo/batch")));
+        assert!(!work_location.should_follow(other));
+        assert!(!work_location.should_follow(other));
+        assert!(work_location.should_follow(other));
+
+        work_location.moved_to(other.to_path_buf());
+        assert!(!work_location.should_follow(other));
     }
 }
