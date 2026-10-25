@@ -86,6 +86,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use sum_tree::{Edit, SumTree, TreeMap};
+use sysinfo::{
+    Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal, System, UpdateKind,
+};
 use task::Shell;
 use text::{Bias, BufferId, OffsetRangeExt, Rope, ToOffset};
 use util::{
@@ -9660,6 +9663,21 @@ impl Repository {
                         // `git worktree remove` must see the dirty working tree to
                         // refuse the operation.
                         if force {
+                            // Processes started in the worktree, such as dev servers
+                            // an agent session left running, would outlive it and
+                            // keep writing into a recreated directory.
+                            if !fs.is_fake() {
+                                let directory = fs
+                                    .canonicalize(&path)
+                                    .await
+                                    .unwrap_or_else(|_| path.clone());
+                                let executor = cx.background_executor().clone();
+                                cx.background_spawn(terminate_processes_in_directory(
+                                    directory, executor,
+                                ))
+                                .await;
+                            }
+
                             fs.remove_dir(
                                 &path,
                                 RemoveOptions {
@@ -10957,6 +10975,112 @@ pub fn worktrees_directory_for_repo(
     Ok(resolved)
 }
 
+const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Asks the processes running in `directory`, and their descendants, to exit,
+/// then kills the ones still running after [`PROCESS_EXIT_TIMEOUT`].
+async fn terminate_processes_in_directory(directory: PathBuf, executor: BackgroundExecutor) {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+    );
+    let pids = processes_in_directory(&system, &directory);
+    if pids.is_empty() {
+        return;
+    }
+
+    log::info!(
+        "Stopping {} processes running in worktree {}",
+        pids.len(),
+        directory.display()
+    );
+    for pid in &pids {
+        if let Some(process) = system.process(*pid) {
+            let signaled = process
+                .kill_with(Signal::Term)
+                .unwrap_or_else(|| process.kill());
+            if !signaled {
+                log::warn!("Failed to stop process {pid} running in the worktree");
+            }
+        }
+    }
+
+    let deadline = Instant::now() + PROCESS_EXIT_TIMEOUT;
+    loop {
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&pids),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        // Zed's own children stay as zombies until reaped, but they have exited.
+        let remaining = pids
+            .iter()
+            .filter_map(|pid| system.process(*pid))
+            .filter(|process| process.status() != ProcessStatus::Zombie)
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            for process in remaining {
+                if !process.kill() {
+                    log::warn!(
+                        "Failed to kill process {} running in the worktree",
+                        process.pid()
+                    );
+                }
+            }
+            return;
+        }
+        executor.timer(Duration::from_millis(100)).await;
+    }
+}
+
+/// Returns the processes whose working directory is inside `directory`, along
+/// with their descendants.
+fn processes_in_directory(system: &System, directory: &Path) -> Vec<Pid> {
+    let Ok(current_pid) = sysinfo::get_current_pid() else {
+        return Vec::new();
+    };
+
+    // Zed itself may have been started from inside the worktree, for example
+    // by `cargo run`, and stopping its ancestors would stop Zed.
+    let mut protected_pids = HashSet::new();
+    let mut ancestor = Some(current_pid);
+    while let Some(pid) = ancestor {
+        if !protected_pids.insert(pid) {
+            break;
+        }
+        ancestor = system.process(pid).and_then(|process| process.parent());
+    }
+
+    let mut children_by_parent: HashMap<Pid, Vec<Pid>> = HashMap::default();
+    for (pid, process) in system.processes() {
+        if let Some(parent) = process.parent() {
+            children_by_parent.entry(parent).or_default().push(*pid);
+        }
+    }
+
+    let mut pending = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| process.cwd().is_some_and(|cwd| cwd.starts_with(directory)))
+        .map(|(pid, _)| *pid)
+        .collect::<Vec<_>>();
+    let mut found = HashSet::new();
+    while let Some(pid) = pending.pop() {
+        if protected_pids.contains(&pid) || !found.insert(pid) {
+            continue;
+        }
+        if let Some(children) = children_by_parent.get(&pid) {
+            pending.extend(children);
+        }
+    }
+    found.into_iter().collect()
+}
+
 async fn remove_empty_managed_worktree_ancestors(fs: &dyn Fs, child_path: &Path, base_path: &Path) {
     let mut current = child_path;
     while let Some(parent) = current.parent() {
@@ -11558,6 +11682,59 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_processes_in_directory_includes_descendants() {
+        let worktree = tempfile::tempdir().expect("failed to create worktree directory");
+        let worktree_path = std::fs::canonicalize(worktree.path()).expect("failed to canonicalize");
+        let elsewhere = tempfile::tempdir().expect("failed to create other directory");
+        #[allow(clippy::disallowed_methods)]
+        let mut shell = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "cd {} && sleep 30 & wait",
+                elsewhere.path().display()
+            ))
+            .current_dir(&worktree_path)
+            .spawn()
+            .expect("failed to spawn shell");
+        let shell_pid = Pid::from_u32(shell.id());
+
+        let mut system = System::new();
+        let mut found = Vec::new();
+        for _ in 0..50 {
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+            );
+            found = processes_in_directory(&system, &worktree_path);
+            if found.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let sleep_pids = system
+            .processes()
+            .iter()
+            .filter(|(_, process)| process.parent() == Some(shell_pid))
+            .map(|(pid, _)| *pid)
+            .collect::<Vec<_>>();
+        for pid in &sleep_pids {
+            if let Some(process) = system.process(*pid) {
+                process.kill();
+            }
+        }
+        shell.kill().expect("failed to kill shell");
+        shell.wait().expect("failed to wait for shell");
+
+        assert!(found.contains(&shell_pid));
+        assert!(!sleep_pids.is_empty());
+        assert!(sleep_pids.iter().all(|pid| found.contains(pid)));
+        let current_pid = sysinfo::get_current_pid().expect("failed to get current pid");
+        assert!(!found.contains(&current_pid));
     }
 
     type TestPasswordPrompt = (
