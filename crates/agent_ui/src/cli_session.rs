@@ -29,6 +29,8 @@ const TERMINAL_START_TIMEOUT: Duration = Duration::from_secs(30);
 const TERMINAL_PANEL_LOAD_ATTEMPTS: usize = 100;
 const TERMINAL_PANEL_LOAD_INTERVAL: Duration = Duration::from_millis(100);
 const TOOL_USES_BEFORE_FOLLOWING_WORK: usize = 3;
+const SESSION_EXIT_ATTEMPTS: usize = 100;
+const SESSION_EXIT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Agents that ship a command line client which can run in the terminal panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +356,57 @@ fn session_terminal_labels(
         labels.push(started_label.clone());
     }
     labels
+}
+
+/// Quits the Claude session of a thread that is being archived, by typing
+/// `/exit` as the user would, so that the hooks Claude runs when a session ends
+/// get to run before the worktree of the thread is deleted. The tab of its
+/// terminal is closed once the session quit. The task is done when that
+/// happened, or after a few seconds when the session did not quit, for
+/// instance because it is in the middle of a turn: its terminal is then left
+/// alone. Returns `None` when the thread has no running Claude session.
+pub fn exit_session(
+    agent_id: &AgentId,
+    session_id: &acp_v2::SessionId,
+    terminal_panels: &[Entity<TerminalPanel>],
+    window: AnyWindowHandle,
+    cx: &mut App,
+) -> Option<Task<()>> {
+    let agent = CliAgent::from_agent_id(agent_id).filter(|agent| *agent == CliAgent::Claude)?;
+    let labels = session_terminal_labels(agent, session_id, cx);
+    let (terminal_panel, label) = terminal_panels.iter().find_map(|terminal_panel| {
+        let label = terminal_panel.update(cx, |terminal_panel, cx| {
+            labels
+                .iter()
+                .find(|label| terminal_panel.send_input_to_task_terminal(label, "/exit\r", cx))
+                .cloned()
+        })?;
+        Some((terminal_panel.downgrade(), label))
+    })?;
+
+    Some(cx.spawn(async move |cx| {
+        for _ in 0..SESSION_EXIT_ATTEMPTS {
+            cx.background_executor().timer(SESSION_EXIT_INTERVAL).await;
+            let Ok(still_running) = terminal_panel.update(cx, |terminal_panel, cx| {
+                terminal_panel.has_running_task_terminal(&label, cx)
+            }) else {
+                return;
+            };
+            if still_running {
+                continue;
+            }
+            window
+                .update(cx, |_, window, cx| {
+                    terminal_panel
+                        .update(cx, |terminal_panel, cx| {
+                            terminal_panel.close_task_terminal(&label, window, cx);
+                        })
+                        .log_err();
+                })
+                .log_err();
+            return;
+        }
+    }))
 }
 
 /// Renames the CLI session of a thread. The title shown by the sidebar and
@@ -1874,6 +1927,80 @@ fn spawn_in_terminal_panel(
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    #[gpui::test]
+    async fn test_exit_session_quits_the_session_and_closes_its_tab(cx: &mut TestAppContext) {
+        use futures::FutureExt as _;
+        use gpui::VisualTestContext;
+
+        cx.executor().allow_parking();
+        let app_state = cx.update(workspace::AppState::test);
+        cx.update(|cx| theme_settings::init(theme::LoadThemes::JustBase, cx));
+        let project = project::Project::test(app_state.fs.clone(), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let terminal_panel = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                    workspace.add_panel(panel.clone(), window, cx);
+                    panel
+                })
+            })
+            .expect("the terminal panel should be added");
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let session_id = acp_v2::SessionId::new("0b5f6c1e-7d3a-4c39-9a7e-2f1d8e6b4a90");
+        let label = CliAgent::Claude.resume_label(&session_id);
+        // Quits on its first line of input, like Claude on `/exit`.
+        let task = SpawnInTerminal {
+            full_label: label.clone(),
+            label: label.clone(),
+            command: Some("sh".to_string()),
+            args: vec!["-c".to_string(), "read line".to_string()],
+            ..Default::default()
+        };
+        terminal_panel
+            .update_in(cx, |terminal_panel, window, cx| {
+                terminal_panel.spawn_task(&task, window, cx)
+            })
+            .await
+            .expect("the session terminal should start");
+        cx.run_until_parked();
+        terminal_panel.update(cx, |terminal_panel, cx| {
+            assert!(terminal_panel.has_running_task_terminal(&label, cx));
+        });
+
+        let mut exit = cx
+            .update(|window, cx| {
+                exit_session(
+                    &CliAgent::Claude.agent_id(),
+                    &session_id,
+                    std::slice::from_ref(&terminal_panel),
+                    window.window_handle(),
+                    cx,
+                )
+            })
+            .expect("a running session should be asked to quit");
+        let mut quit = false;
+        for _ in 0..200 {
+            cx.executor().advance_clock(SESSION_EXIT_INTERVAL);
+            cx.run_until_parked();
+            if (&mut exit).now_or_never().is_some() {
+                quit = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(quit, "the session should have quit");
+
+        terminal_panel.update_in(cx, |terminal_panel, window, cx| {
+            assert!(!terminal_panel.has_running_task_terminal(&label, cx));
+            assert!(
+                !terminal_panel.close_task_terminal(&label, window, cx),
+                "the tab of the session should have been closed"
+            );
+        });
+    }
 
     #[gpui::test]
     fn test_session_id_for_terminal_label(cx: &mut TestAppContext) {

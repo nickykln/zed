@@ -801,6 +801,8 @@ pub struct Sidebar {
     /// Threads in the database-backed regeneration path need their own loading
     /// state because they do not have a live `agent::Thread` to report it.
     regenerating_titles: HashSet<ThreadId>,
+    /// CLI sessions asked to quit before their thread is archived.
+    exiting_cli_sessions: HashSet<acp::SessionId>,
     /// Starting a rename must seed the current title into the title editor,
     /// so this prevents that BufferEdited event from being interpreted as user input.
     suppress_next_rename_edit: bool,
@@ -969,6 +971,7 @@ impl Sidebar {
             hovered_thread_index: None,
             rename_target: None,
             regenerating_titles: HashSet::new(),
+            exiting_cli_sessions: HashSet::new(),
             suppress_next_rename_edit: false,
 
             thread_last_accessed: HashMap::new(),
@@ -3755,17 +3758,7 @@ impl Sidebar {
         let Some(session_id) = metadata.session_id.as_ref() else {
             return;
         };
-        let terminal_panels: Vec<_> = self
-            .multi_workspace
-            .upgrade()
-            .map(|multi_workspace| {
-                multi_workspace
-                    .read(cx)
-                    .workspaces()
-                    .filter_map(|workspace| workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let terminal_panels = self.terminal_panels(cx);
         agent_ui::rename_session(
             &metadata.agent_id,
             session_id,
@@ -3774,6 +3767,19 @@ impl Sidebar {
             &terminal_panels,
             cx,
         );
+    }
+
+    fn terminal_panels(&self, cx: &App) -> Vec<Entity<agent_ui::TerminalPanel>> {
+        self.multi_workspace
+            .upgrade()
+            .map(|multi_workspace| {
+                multi_workspace
+                    .read(cx)
+                    .workspaces()
+                    .filter_map(|workspace| workspace.read(cx).panel::<agent_ui::TerminalPanel>(cx))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn finish_entry_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -5689,7 +5695,40 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.archive_thread_loading_closed_workspace(session_id, true, window, cx);
+        if self.exiting_cli_sessions.contains(session_id) {
+            return;
+        }
+        // The worktree of the thread may be deleted by archiving it, so its
+        // session quits first, which lets the hooks it runs on exit finish.
+        let metadata = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(session_id)
+            .cloned();
+        let terminal_panels = self.terminal_panels(cx);
+        let exit = metadata.and_then(|metadata| {
+            agent_ui::exit_session(
+                &metadata.agent_id,
+                session_id,
+                &terminal_panels,
+                window.window_handle(),
+                cx,
+            )
+        });
+        let Some(exit) = exit else {
+            self.archive_thread_loading_closed_workspace(session_id, true, window, cx);
+            return;
+        };
+
+        self.exiting_cli_sessions.insert(session_id.clone());
+        let session_id = session_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            exit.await;
+            this.update_in(cx, |this, window, cx| {
+                this.exiting_cli_sessions.remove(&session_id);
+                this.archive_thread_loading_closed_workspace(&session_id, true, window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     /// `load_closed_workspace` must be false when called back after the

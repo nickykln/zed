@@ -903,6 +903,25 @@ impl TerminalPanel {
         Some((terminal, custom_title))
     }
 
+    /// Closes the tab of the terminal that ran the task with this label, which
+    /// stays open once the task ended. Closing a terminal still running its
+    /// task stops it. Returns `false` when there is none.
+    pub fn close_task_terminal(
+        &mut self,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((_, pane, terminal_view)) = self.terminals_for_task(label, cx).pop() else {
+            return false;
+        };
+        let item_id = terminal_view.entity_id();
+        pane.update(cx, |pane, cx| {
+            pane.remove_item(item_id, false, true, window, cx);
+        });
+        true
+    }
+
     /// Adds a terminal taken from the panel of another workspace with
     /// [`Self::take_running_task_terminal`]. Without `focus`, the terminal
     /// becomes the active tab but keeps the keyboard focus where it is.
@@ -3021,6 +3040,46 @@ mod tests {
                 terminal_view.focus_handle(cx).contains_focused(window, cx),
                 "with no modal open, a new task terminal should take focus"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_close_task_terminal_closes_the_tab_of_the_task(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        let task = SpawnInTerminal {
+            full_label: "session task".to_owned(),
+            ..echo_task()
+        };
+        terminal_panel
+            .update_in(cx, |terminal_panel, window, cx| {
+                terminal_panel.add_terminal_task(task, RevealStrategy::Always, window, cx)
+            })
+            .await
+            .expect("Failed to spawn a task terminal");
+        cx.run_until_parked();
+
+        terminal_panel.update_in(cx, |terminal_panel, window, cx| {
+            assert!(
+                !terminal_panel.close_task_terminal("another task", window, cx),
+                "no tab should be closed for a label no task has"
+            );
+            assert_eq!(
+                terminal_panel.terminals_for_task("session task", cx).len(),
+                1
+            );
+
+            assert!(terminal_panel.close_task_terminal("session task", window, cx));
+            assert!(
+                terminal_panel
+                    .terminals_for_task("session task", cx)
+                    .is_empty()
+            );
+            assert!(!terminal_panel.close_task_terminal("session task", window, cx));
         });
     }
 
