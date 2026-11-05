@@ -1014,7 +1014,9 @@ fn watch_session_status(
                     .background_executor()
                     .spawn(async move {
                         (
-                            work_path.and_then(|path| git_worktree_root(&path)),
+                            work_path
+                                .and_then(|path| git_worktree_root(&path))
+                                .filter(|root| !is_in_temporary_directory(root)),
                             working_directory.and_then(|path| git_worktree_root(&path)),
                         )
                     })
@@ -1245,9 +1247,10 @@ fn parse_hook_log(contents: &[u8]) -> (Vec<serde_json::Value>, usize) {
 }
 
 /// Path a tool use shows the session works in: the file an editing tool
-/// changed, or the directory a shell command first moves to. A session can
-/// work in another git worktree than its working directory, by starting each
-/// shell command with `cd`.
+/// changed. A session can edit files of another git worktree than its working
+/// directory. Shell commands are not looked at: Claude drops a `cd` to a
+/// directory it can't work in, so only the working directory of the hooks
+/// tells where a shell command ran.
 fn work_path_from_hook_input(hook_input: &serde_json::Value) -> Option<PathBuf> {
     let field = |value: &serde_json::Value, key: &str| {
         value
@@ -1262,7 +1265,6 @@ fn work_path_from_hook_input(hook_input: &serde_json::Value) -> Option<PathBuf> 
     let path = match field(hook_input, "tool_name")?.as_str() {
         "Edit" | "MultiEdit" | "Write" => field(tool_input, "file_path")?,
         "NotebookEdit" => field(tool_input, "notebook_path")?,
-        "Bash" => leading_cd_directory(&field(tool_input, "command")?)?,
         _ => return None,
     };
     let path = match path.strip_prefix("~/") {
@@ -1275,19 +1277,6 @@ fn work_path_from_hook_input(hook_input: &serde_json::Value) -> Option<PathBuf> 
     Some(PathBuf::from(field(hook_input, "cwd")?).join(path))
 }
 
-/// Directory a shell command starts by moving to, like in
-/// `cd /repo/.worktrees/feature && cargo test`.
-fn leading_cd_directory(command: &str) -> Option<String> {
-    let arguments = command.trim_start().strip_prefix("cd ")?.trim_start();
-    let directory = match arguments.chars().next()? {
-        quote @ ('\'' | '"') => arguments[1..].split(quote).next()?,
-        _ => arguments
-            .split(|character: char| character.is_whitespace() || "&;|".contains(character))
-            .next()?,
-    };
-    (!directory.is_empty()).then(|| directory.to_string())
-}
-
 /// Root of the git worktree containing a path: the closest directory with a
 /// `.git` entry, which is a file in linked worktrees. It is canonicalized, as
 /// shell commands reach the same worktree through paths like `../feature`.
@@ -1296,6 +1285,16 @@ fn git_worktree_root(path: &Path) -> Option<PathBuf> {
         .ancestors()
         .find(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok())?;
     Some(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
+}
+
+/// Whether a path is in a temporary directory, where Claude makes throwaway
+/// checkouts of its own, like the ones it uses to review a branch. A session
+/// doesn't work there, even though it touches files of such a checkout. The
+/// path has to be canonicalized.
+fn is_in_temporary_directory(path: &Path) -> bool {
+    [std::env::temp_dir(), PathBuf::from("/tmp")]
+        .into_iter()
+        .any(|directory| path.starts_with(std::fs::canonicalize(&directory).unwrap_or(directory)))
 }
 
 /// Where a session works, followed from its tool uses. It is only followed
@@ -2141,24 +2140,6 @@ mod tests {
     }
 
     #[test]
-    fn test_leading_cd_directory() {
-        assert_eq!(
-            leading_cd_directory("cd /repo/.worktrees/doe && uv run pytest"),
-            Some("/repo/.worktrees/doe".to_string())
-        );
-        assert_eq!(
-            leading_cd_directory("  cd '/repo/my worktree'; ls"),
-            Some("/repo/my worktree".to_string())
-        );
-        assert_eq!(
-            leading_cd_directory("cd ../other|cat"),
-            Some("../other".to_string())
-        );
-        assert_eq!(leading_cd_directory("git status"), None);
-        assert_eq!(leading_cd_directory("cd "), None);
-    }
-
-    #[test]
     fn test_work_path_from_hook_input() {
         let work_path = |hook_input: serde_json::Value| work_path_from_hook_input(&hook_input);
         assert_eq!(
@@ -2172,11 +2153,20 @@ mod tests {
         assert_eq!(
             work_path(serde_json::json!({
                 "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "cwd": "/repo/.worktrees/batch",
+                "tool_input": { "file_path": "../doe/src/main.py" },
+            })),
+            Some(PathBuf::from("/repo/.worktrees/batch/../doe/src/main.py"))
+        );
+        assert_eq!(
+            work_path(serde_json::json!({
+                "hook_event_name": "PostToolUse",
                 "tool_name": "Bash",
                 "cwd": "/repo/.worktrees/batch",
                 "tool_input": { "command": "cd ../doe && pytest" },
             })),
-            Some(PathBuf::from("/repo/.worktrees/batch/../doe"))
+            None
         );
         assert_eq!(
             work_path(serde_json::json!({
@@ -2194,6 +2184,20 @@ mod tests {
             })),
             None
         );
+    }
+
+    #[test]
+    fn test_is_in_temporary_directory() {
+        for directory in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+            if let Ok(directory) = std::fs::canonicalize(directory) {
+                assert!(is_in_temporary_directory(
+                    &directory.join("claude/scratchpad/pr-instance")
+                ));
+            }
+        }
+        assert!(!is_in_temporary_directory(Path::new(
+            "/Users/someone/worktrees/project/feature"
+        )));
     }
 
     #[test]
