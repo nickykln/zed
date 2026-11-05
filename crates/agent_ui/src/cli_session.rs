@@ -908,6 +908,8 @@ fn watch_session_status(
         let mut last_working_directory = None;
         let mut hook_log_offset = 0;
         let mut work_location = WorkLocation::default();
+        let mut transcript_file: Option<PathBuf> = None;
+        let mut transcript_offset = 0;
         loop {
             cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
 
@@ -937,6 +939,15 @@ fn watch_session_status(
                 .await;
             hook_log_offset = read_up_to;
             for hook_input in hook_inputs {
+                if let Some(path) = hook_input
+                    .get("transcript_path")
+                    .and_then(|path| path.as_str())
+                    .map(PathBuf::from)
+                    && transcript_file.as_ref() != Some(&path)
+                {
+                    transcript_file = Some(path);
+                    transcript_offset = 0;
+                }
                 let work_path = work_path_from_hook_input(&hook_input);
                 let working_directory = hook_input
                     .get("cwd")
@@ -979,6 +990,34 @@ fn watch_session_status(
                 let terminal_panel = session_terminal_panel(&session_id, &terminal_panel, cx);
                 warn_on_shared_worktree_branch_change(&terminal_panel, window, cx);
             });
+
+            let is_busy = cx.update(|cx| {
+                matches!(
+                    session_status(&session_id, cx),
+                    Some(AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation)
+                )
+            });
+            if is_busy && let Some(transcript_file) = transcript_file.clone() {
+                let (interrupted_at, read_up_to) = cx
+                    .background_executor()
+                    .spawn(
+                        async move { read_last_interruption(&transcript_file, transcript_offset) },
+                    )
+                    .await;
+                transcript_offset = read_up_to;
+                // Interruptions older than the last hook belong to a previous
+                // turn.
+                if let Some(interrupted_at) = interrupted_at
+                    && last_modified.is_none_or(|last_modified| interrupted_at > last_modified)
+                {
+                    cx.update(|cx| {
+                        cx.default_global::<CliSessions>()
+                            .statuses
+                            .remove(&session_id);
+                        dismiss_session_notification(&session_id, cx);
+                    });
+                }
+            }
 
             let (modified, hook_input) = cx
                 .background_executor()
@@ -1241,6 +1280,68 @@ impl WorkLocation {
         self.candidate_root = None;
         self.candidate_tool_uses = 0;
     }
+}
+
+/// Text of the message Claude records in its transcript when the user
+/// interrupts a turn, followed by " for tool use]" when a tool was running.
+/// Claude runs no hook on an interruption, so the transcript is the only place
+/// telling that the turn ended.
+const INTERRUPTION_MESSAGE_PREFIX: &str = "[Request interrupted by user";
+
+/// Reads the entries appended to a Claude transcript from `offset` on, and
+/// returns the time of the last interruption among them with the offset to
+/// read from next. An entry Claude is still writing is read again on the next
+/// call.
+fn read_last_interruption(transcript_file: &Path, offset: u64) -> (Option<SystemTime>, u64) {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let mut contents = Vec::new();
+    let read = std::fs::File::open(transcript_file).and_then(|mut file| {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_to_end(&mut contents)
+    });
+    if read.is_err() {
+        return (None, offset);
+    }
+    let Some(complete_length) = contents.iter().rposition(|byte| *byte == b'\n') else {
+        return (None, offset);
+    };
+    let interrupted_at = contents[..complete_length]
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let line = std::str::from_utf8(line).ok()?;
+            if !line.contains(INTERRUPTION_MESSAGE_PREFIX) {
+                return None;
+            }
+            interruption_time(&serde_json::from_str(line).ok()?)
+        })
+        .max();
+    (interrupted_at, offset + complete_length as u64 + 1)
+}
+
+/// Time of a transcript entry recording that the user interrupted the main
+/// conversation. Other entries, like the requests Claude sends to the API,
+/// also quote earlier interruptions, so only user messages count.
+fn interruption_time(entry: &serde_json::Value) -> Option<SystemTime> {
+    let field = |key: &str| entry.get(key).and_then(|value| value.as_str());
+    if field("type")? != "user" || entry.get("isSidechain") == Some(&serde_json::Value::Bool(true))
+    {
+        return None;
+    }
+    let is_interruption =
+        |text: Option<&str>| text.is_some_and(|text| text.starts_with(INTERRUPTION_MESSAGE_PREFIX));
+    let interrupted = match entry.get("message")?.get("content")? {
+        serde_json::Value::String(text) => is_interruption(Some(text)),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .any(|block| is_interruption(block.get("text").and_then(|text| text.as_str()))),
+        _ => false,
+    };
+    if !interrupted {
+        return None;
+    }
+    let timestamp = chrono::DateTime::parse_from_rfc3339(field("timestamp")?).ok()?;
+    Some(SystemTime::from(timestamp))
 }
 
 /// Warns when the branch of a git worktree changes while several sessions run
@@ -1956,5 +2057,112 @@ mod tests {
 
         work_location.moved_to(other.to_path_buf());
         assert!(!work_location.should_follow(other));
+    }
+
+    #[test]
+    fn test_interruption_time() {
+        let time = |timestamp: &str| {
+            SystemTime::from(chrono::DateTime::parse_from_rfc3339(timestamp).unwrap())
+        };
+        let interruption = serde_json::json!({
+            "type": "user",
+            "isSidechain": false,
+            "message": {
+                "role": "user",
+                "content": [{ "type": "text", "text": "[Request interrupted by user]" }],
+            },
+            "timestamp": "2026-10-25T14:24:03.981Z",
+        });
+        assert_eq!(
+            interruption_time(&interruption),
+            Some(time("2026-10-25T14:24:03.981Z"))
+        );
+
+        let tool_use_interruption = serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "content": "The user doesn't want to proceed", "is_error": true },
+                    { "type": "text", "text": "[Request interrupted by user for tool use]" },
+                ],
+            },
+            "timestamp": "2026-10-25T14:25:00.000Z",
+        });
+        assert_eq!(
+            interruption_time(&tool_use_interruption),
+            Some(time("2026-10-25T14:25:00.000Z"))
+        );
+
+        let string_content = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "[Request interrupted by user]" },
+            "timestamp": "2026-10-25T14:26:00.000Z",
+        });
+        assert_eq!(
+            interruption_time(&string_content),
+            Some(time("2026-10-25T14:26:00.000Z"))
+        );
+
+        let api_request = serde_json::json!({
+            "type": "api-request-blob",
+            "message": {
+                "role": "user",
+                "content": [{ "type": "text", "text": "[Request interrupted by user]\n" }],
+            },
+        });
+        assert_eq!(interruption_time(&api_request), None);
+
+        let mut sidechain = interruption;
+        sidechain["isSidechain"] = serde_json::Value::Bool(true);
+        assert_eq!(interruption_time(&sidechain), None);
+
+        let prompt = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "Arrête [Request interrupted by user]" },
+            "timestamp": "2026-10-25T14:27:00.000Z",
+        });
+        assert_eq!(interruption_time(&prompt), None);
+    }
+
+    #[test]
+    fn test_read_last_interruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript_file = directory.path().join("transcript.jsonl");
+        let interruption = |timestamp: &str| {
+            serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": "[Request interrupted by user]" },
+                "timestamp": timestamp,
+            })
+            .to_string()
+        };
+        let first = interruption("2026-10-25T14:24:00Z");
+        let second = interruption("2026-10-25T14:25:00Z");
+        std::fs::write(
+            &transcript_file,
+            format!("{{\"type\":\"mode\"}}\n{first}\n{second}\n{{\"type\":\"us"),
+        )
+        .unwrap();
+
+        let (interrupted_at, offset) = read_last_interruption(&transcript_file, 0);
+        assert_eq!(
+            interrupted_at,
+            Some(SystemTime::from(
+                chrono::DateTime::parse_from_rfc3339("2026-10-25T14:25:00Z").unwrap()
+            ))
+        );
+        let complete_length =
+            std::fs::read(&transcript_file).unwrap().len() - "{\"type\":\"us".len();
+        assert_eq!(offset, complete_length as u64);
+
+        assert_eq!(
+            read_last_interruption(&transcript_file, offset),
+            (None, offset)
+        );
+        assert_eq!(
+            read_last_interruption(&directory.path().join("missing.jsonl"), 3),
+            (None, 3)
+        );
     }
 }
