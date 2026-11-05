@@ -904,11 +904,13 @@ impl TerminalPanel {
     }
 
     /// Adds a terminal taken from the panel of another workspace with
-    /// [`Self::take_running_task_terminal`].
+    /// [`Self::take_running_task_terminal`]. Without `focus`, the terminal
+    /// becomes the active tab but keeps the keyboard focus where it is.
     pub fn add_moved_terminal(
         &mut self,
         terminal: Entity<Terminal>,
         custom_title: Option<String>,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
@@ -927,7 +929,7 @@ impl TerminalPanel {
             terminal_view
         });
         self.active_pane.update(cx, |pane, cx| {
-            pane.add_item(Box::new(terminal_view), true, true, None, window, cx);
+            pane.add_item(Box::new(terminal_view), focus, focus, None, window, cx);
         });
         Ok(())
     }

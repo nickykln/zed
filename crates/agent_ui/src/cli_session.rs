@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
 use gpui::{
     AnyWindowHandle, App, AppContext as _, AsyncApp, Entity, Global, SharedString, Subscription,
-    TaskExt as _, WeakEntity, Window, WindowHandle,
+    Task, TaskExt as _, WeakEntity, Window, WindowHandle,
 };
 use project::AgentId;
 use settings::{NotifyWhenAgentWaiting, Settings as _};
@@ -1472,7 +1472,10 @@ impl GitWorktree {
 /// Follows a Claude session whose working directory moved to another git
 /// worktree of the same repository, like with its `EnterWorktree` tool: opens
 /// the workspace of that worktree, moves the session's terminal to its
-/// terminal panel and files the thread under that worktree.
+/// terminal panel and files the thread under that worktree. The window shows
+/// the worktree and focuses the terminal only when the user is looking at the
+/// session, so that a session working in the background does not pull them
+/// away from what they are doing.
 async fn follow_session_to_worktree(
     session_id: &acp_v2::SessionId,
     terminal_labels: &[String],
@@ -1521,15 +1524,37 @@ async fn follow_session_to_worktree(
         return Ok(());
     }
 
+    let user_is_watching = window.update(cx, |_, window, cx| {
+        window.is_window_active()
+            && terminal_panel.upgrade().is_some_and(|terminal_panel| {
+                terminal_labels.iter().any(|label| {
+                    terminal_panel.update(cx, |terminal_panel, cx| {
+                        terminal_panel.is_task_terminal_focused(label, window, cx)
+                    })
+                })
+            })
+    })?;
+
     let target_paths = PathList::new(std::slice::from_ref(&target.root));
     let target_workspace = window
         .update(cx, |multi_workspace, window, cx| {
+            // `find_or_create_local_workspace` activates the workspace it finds.
+            if !user_is_watching
+                && let Some(workspace) =
+                    multi_workspace.workspace_for_paths(&target_paths, None, cx)
+            {
+                return Task::ready(Ok(workspace));
+            }
             let project_group_key = source_workspace.read(cx).project_group_key(cx);
             multi_workspace.find_or_create_local_workspace(
                 target_paths.clone(),
                 Some(project_group_key),
                 None,
-                OpenMode::Activate,
+                if user_is_watching {
+                    OpenMode::Activate
+                } else {
+                    OpenMode::Add
+                },
                 Some(source_workspace.downgrade()),
                 window,
                 cx,
@@ -1570,11 +1595,13 @@ async fn follow_session_to_worktree(
             return Ok(false);
         };
         target_terminal_panel.update(cx, |terminal_panel, cx| {
-            terminal_panel.add_moved_terminal(terminal, custom_title, window, cx)
+            terminal_panel.add_moved_terminal(terminal, custom_title, user_is_watching, window, cx)
         })?;
-        target_workspace.update(cx, |workspace, cx| {
-            workspace.focus_panel::<TerminalPanel>(window, cx);
-        });
+        if user_is_watching {
+            target_workspace.update(cx, |workspace, cx| {
+                workspace.focus_panel::<TerminalPanel>(window, cx);
+            });
+        }
         anyhow::Ok(true)
     })??;
     if !moved {
