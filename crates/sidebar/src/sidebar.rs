@@ -5689,6 +5689,20 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.archive_thread_loading_closed_workspace(session_id, true, window, cx);
+    }
+
+    /// `load_closed_workspace` must be false when called back after the
+    /// thread's workspace was already opened: if the worktree no longer exists
+    /// on disk, the opened workspace is the project group's one rather than the
+    /// thread's, so the entry stays closed and loading it again never ends.
+    fn archive_thread_loading_closed_workspace(
+        &mut self,
+        session_id: &acp::SessionId,
+        load_closed_workspace: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let store = ThreadMetadataStore::global(cx);
         let metadata = store.read(cx).entry_by_session(session_id).cloned();
         let metadata_thread_id = metadata.as_ref().map(|metadata| metadata.thread_id);
@@ -5737,6 +5751,7 @@ impl Sidebar {
                 project_group_key,
             }),
         ) = (metadata.as_ref(), thread_entry_workspace)
+            && load_closed_workspace
             && self.should_load_closed_workspace_for_archive(
                 &folder_paths,
                 &project_group_key,
@@ -5754,7 +5769,7 @@ impl Sidebar {
                 cx,
                 move |this, _workspace, window, cx| {
                     this.update_entries(cx);
-                    this.archive_thread(&session_id, window, cx);
+                    this.archive_thread_loading_closed_workspace(&session_id, false, window, cx);
                 },
             );
             return;
