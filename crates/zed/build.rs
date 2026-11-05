@@ -82,6 +82,14 @@ fn main() {
         }
     }
 
+    // The releases of this fork are tagged `v<version>-use-cli`. Tags don't
+    // change HEAD, so they are watched on their own.
+    println!("cargo:rerun-if-changed=../../.git/refs/tags");
+    println!("cargo:rerun-if-changed=../../.git/packed-refs");
+    if let Some(cli_version) = cli_version_from_git() {
+        println!("cargo:rustc-env=ZED_CLI_VERSION={cli_version}");
+    }
+
     if cfg!(windows) {
         if cfg!(target_env = "msvc") {
             // todo(windows): This is to avoid stack overflow. Remove it when solved.
@@ -259,4 +267,24 @@ fn prepare_app_icon_x11() {
 
     println!("cargo:rerun-if-env-changed=RELEASE_CHANNEL");
     println!("cargo:rerun-if-changed={}", icon_path().to_string_lossy());
+}
+
+/// Version of the release this build comes from, like `0.1.12`, or `0.1.12+3`
+/// when it has 3 more commits than the release.
+fn cli_version_from_git() -> Option<String> {
+    let output = Command::new("git")
+        .args(["describe", "--tags", "--long", "--match", "v*-use-cli"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let description = String::from_utf8(output.stdout).ok()?;
+    let (tag_and_commits, _commit_sha) = description.trim().rsplit_once("-g")?;
+    let (tag, commits) = tag_and_commits.rsplit_once('-')?;
+    let version = tag.strip_prefix('v')?.strip_suffix("-use-cli")?;
+    match commits.parse::<u32>().ok()? {
+        0 => Some(version.to_string()),
+        commits => Some(format!("{version}+{commits}")),
+    }
 }

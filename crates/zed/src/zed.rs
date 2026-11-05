@@ -1556,7 +1556,7 @@ fn open_about_window(cx: &mut App) {
             let release_channel = ReleaseChannel::global(cx);
             let release_channel_name = release_channel.display_name();
             let full_version: SharedString = AppVersion::global(cx).to_string().into();
-            let version = env!("CARGO_PKG_VERSION");
+            let version = option_env!("ZED_CLI_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
 
             let debug = if cfg!(debug_assertions) {
                 "(debug)"
