@@ -49,6 +49,7 @@ http_client.workspace = true
 icons.workspace = true
 livekit_client.workspace = true
 log.workspace = true
+path.workspace = true
 project.workspace = true
 recent_projects.workspace = true
 remote.workspace = true
