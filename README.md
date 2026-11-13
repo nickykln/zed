@@ -1,3 +1,5 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
 # Zed CLI
 
 A fork of [Zed](https://github.com/zed-industries/zed) that runs the Claude Code and Codex command line clients inside Zed, with their sessions listed in the threads sidebar.
@@ -52,3 +54,4 @@ The change applies right away. Remove the line to turn CLI agents back on.
 ## Upstream
 
 For everything else (features, documentation, contributing), see [zed-industries/zed](https://github.com/zed-industries/zed). Zed is licensed under the terms of its original repository.
+# site-chine
