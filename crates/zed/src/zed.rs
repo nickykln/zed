@@ -1562,6 +1562,7 @@ fn open_about_window(cx: &mut App) {
         app_icon: Arc<Image>,
         message: SharedString,
         commit: Option<SharedString>,
+        zed_version: Option<SharedString>,
         full_version: SharedString,
     }
 
@@ -1570,7 +1571,10 @@ fn open_about_window(cx: &mut App) {
             let release_channel = ReleaseChannel::global(cx);
             let release_channel_name = release_channel.display_name();
             let full_version: SharedString = AppVersion::global(cx).to_string().into();
-            let version = option_env!("ZED_CLI_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+            let cli_version = option_env!("ZED_CLI_VERSION");
+            let version = cli_version.unwrap_or(env!("CARGO_PKG_VERSION"));
+            let zed_version =
+                cli_version.map(|_| SharedString::new_static(env!("CARGO_PKG_VERSION")));
 
             let debug = if cfg!(debug_assertions) {
                 "(debug)"
@@ -1590,21 +1594,21 @@ fn open_about_window(cx: &mut App) {
                 app_icon: about_window_icon(release_channel),
                 message,
                 commit,
+                zed_version,
                 full_version,
             }
         }
 
         fn copy_details(&self, window: &mut Window, cx: &mut Context<Self>) {
-            let content = match self.commit.as_ref() {
-                Some(commit) => {
-                    format!(
-                        "{}\nCommit: {}\nVersion: {}",
-                        self.message, commit, self.full_version
-                    )
-                }
-                None => format!("{}\nVersion: {}", self.message, self.full_version),
-            };
-            cx.write_to_clipboard(ClipboardItem::new_string(content));
+            let mut lines = vec![self.message.to_string()];
+            if let Some(zed_version) = &self.zed_version {
+                lines.push(format!("Based on Zed: {zed_version}"));
+            }
+            if let Some(commit) = &self.commit {
+                lines.push(format!("Commit: {commit}"));
+            }
+            lines.push(format!("Version: {}", self.full_version));
+            cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
             window.remove_window();
         }
     }
@@ -1637,6 +1641,14 @@ fn open_about_window(cx: &mut App) {
                             .items_center()
                             .child(img(self.app_icon.clone()).size_16().flex_none())
                             .child(Headline::new(self.message.clone()))
+                            .when_some(self.zed_version.clone(), |this, zed_version| {
+                                this.child(
+                                    Label::new("Based on Zed")
+                                        .color(Color::Muted)
+                                        .size(LabelSize::XSmall),
+                                )
+                                .child(Label::new(zed_version).size(LabelSize::Small))
+                            })
                             .when_some(self.commit.clone(), |this, commit| {
                                 this.child(
                                     Label::new("Commit")
