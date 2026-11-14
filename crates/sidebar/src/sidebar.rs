@@ -5720,10 +5720,15 @@ impl Sidebar {
         self.exiting_cli_sessions.insert(session_id.clone());
         let session_id = session_id.clone();
         cx.spawn_in(window, async move |this, cx| {
-            exit.await;
+            let quit = exit.await;
             this.update_in(cx, |this, window, cx| {
                 this.exiting_cli_sessions.remove(&session_id);
-                this.archive_thread_after_session_exit(&session_id, window, cx);
+                // A session that keeps running, for instance to ask whether
+                // to stop its background tasks, keeps its thread: the user
+                // has to answer it in its terminal first.
+                if quit {
+                    this.archive_thread_after_session_exit(&session_id, window, cx);
+                }
             })
         })
         .detach_and_log_err(cx);
@@ -6709,6 +6714,13 @@ impl Sidebar {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
             })
             .status(thread.status)
+            .exit_blocked(
+                thread
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|session_id| agent_ui::session_exit_blocked(session_id, cx)),
+            )
             .is_remote(is_remote)
             .when_some(icon_svg, |this, svg| {
                 this.custom_icon_from_external_svg(svg)

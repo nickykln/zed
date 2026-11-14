@@ -49,6 +49,7 @@ pub struct ThreadItem {
     timestamp: SharedString,
     notified: bool,
     status: AgentThreadStatus,
+    exit_blocked: bool,
     selected: bool,
     focused: bool,
     hovered: bool,
@@ -84,6 +85,7 @@ impl ThreadItem {
             timestamp: "".into(),
             notified: false,
             status: AgentThreadStatus::default(),
+            exit_blocked: false,
             selected: false,
             focused: false,
             hovered: false,
@@ -142,6 +144,13 @@ impl ThreadItem {
 
     pub fn status(mut self, status: AgentThreadStatus) -> Self {
         self.status = status;
+        self
+    }
+
+    /// Marks a thread whose session was asked to quit but still runs. Takes
+    /// precedence over [`Self::status`].
+    pub fn exit_blocked(mut self, exit_blocked: bool) -> Self {
+        self.exit_blocked = exit_blocked;
         self
     }
 
@@ -311,7 +320,13 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         };
 
-        let status_icon = if self.status == AgentThreadStatus::Error {
+        let status_icon = if self.exit_blocked {
+            Some(
+                Icon::new(IconName::Circle)
+                    .size(IconSize::Small)
+                    .color(Color::Warning),
+            )
+        } else if self.status == AgentThreadStatus::Error {
             Some(
                 Icon::new(IconName::Close)
                     .size(IconSize::Small)
@@ -339,7 +354,7 @@ impl RenderOnce for ThreadItem {
             None
         };
 
-        let icon = if self.status == AgentThreadStatus::Running {
+        let icon = if self.status == AgentThreadStatus::Running && !self.exit_blocked {
             icon_container()
                 .child(
                     Icon::new(IconName::LoadCircle)
@@ -407,10 +422,11 @@ impl RenderOnce for ThreadItem {
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
 
-        let show_tooltip = matches!(
-            self.status,
-            AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
-        );
+        let show_tooltip = self.exit_blocked
+            || matches!(
+                self.status,
+                AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
+            );
 
         let linked_worktrees: Vec<ThreadItemWorktreeInfo> = self
             .worktrees
@@ -616,7 +632,17 @@ impl RenderOnce for ThreadItem {
             })
             .when(show_tooltip, |this| {
                 let status = self.status;
+                let exit_blocked = self.exit_blocked;
                 this.tooltip(Tooltip::element(move |_, _| match status {
+                    _ if exit_blocked => h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::Circle)
+                                .size(IconSize::Small)
+                                .color(Color::Warning),
+                        )
+                        .child(Label::new("Session Did Not Exit, See Its Terminal"))
+                        .into_any_element(),
                     AgentThreadStatus::Error => h_flex()
                         .gap_1()
                         .child(

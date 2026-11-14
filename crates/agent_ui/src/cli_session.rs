@@ -289,6 +289,8 @@ pub struct CliSessions {
     worktree_branches: HashMap<PathBuf, String>,
     /// Pop-ups telling that a session waits for the user.
     notifications: HashMap<acp_v2::SessionId, SessionNotification>,
+    /// Sessions still running after being asked to quit, until they do.
+    blocked_exits: HashSet<acp_v2::SessionId>,
 }
 
 struct SessionNotification {
@@ -304,6 +306,13 @@ pub fn session_status(session_id: &acp_v2::SessionId, cx: &App) -> Option<AgentT
         .statuses
         .get(session_id)
         .copied()
+}
+
+/// Whether the session did not quit when asked to by [`exit_session`], and
+/// still runs.
+pub fn session_exit_blocked(session_id: &acp_v2::SessionId, cx: &App) -> bool {
+    cx.try_global::<CliSessions>()
+        .is_some_and(|sessions| sessions.blocked_exits.contains(session_id))
 }
 
 /// Terminal panel the session runs in: `started_in`, unless the session moved
@@ -361,17 +370,19 @@ fn session_terminal_labels(
 /// Quits the Claude session of a thread that is being archived, by typing
 /// `/exit` as the user would, so that the hooks Claude runs when a session ends
 /// get to run before the worktree of the thread is deleted. The tab of its
-/// terminal is closed once the session quit. The task is done when that
-/// happened, or after a few seconds when the session did not quit, for
-/// instance because it is in the middle of a turn: its terminal is then left
-/// alone. Returns `None` when the thread has no running Claude session.
+/// terminal is closed once the session quit, and the task resolves to `true`.
+/// It resolves to `false` after a few seconds when the session did not quit,
+/// for instance because it asks to confirm stopping its background tasks or
+/// is in the middle of a turn: its terminal is then left alone, and
+/// [`session_exit_blocked`] tells so until the session quits. Returns `None`
+/// when the thread has no running Claude session.
 pub fn exit_session(
     agent_id: &AgentId,
     session_id: &acp_v2::SessionId,
     terminal_panels: &[Entity<TerminalPanel>],
     window: AnyWindowHandle,
     cx: &mut App,
-) -> Option<Task<()>> {
+) -> Option<Task<bool>> {
     let agent = CliAgent::from_agent_id(agent_id).filter(|agent| *agent == CliAgent::Claude)?;
     let labels = session_terminal_labels(agent, session_id, cx);
     let (terminal_panel, label) = terminal_panels.iter().find_map(|terminal_panel| {
@@ -384,13 +395,14 @@ pub fn exit_session(
         Some((terminal_panel.downgrade(), label))
     })?;
 
+    let session_id = session_id.clone();
     Some(cx.spawn(async move |cx| {
         for _ in 0..SESSION_EXIT_ATTEMPTS {
             cx.background_executor().timer(SESSION_EXIT_INTERVAL).await;
             let Ok(still_running) = terminal_panel.update(cx, |terminal_panel, cx| {
                 terminal_panel.has_running_task_terminal(&label, cx)
             }) else {
-                return;
+                return true;
             };
             if still_running {
                 continue;
@@ -404,9 +416,52 @@ pub fn exit_session(
                         .log_err();
                 })
                 .log_err();
-            return;
+            return true;
         }
+        cx.update(|cx| {
+            // Asking again while the session is already blocked must not
+            // watch its terminal twice.
+            let newly_blocked = cx
+                .default_global::<CliSessions>()
+                .blocked_exits
+                .insert(session_id.clone());
+            if newly_blocked {
+                unblock_exit_when_session_quits(session_id, terminal_panel, label, cx);
+            }
+        });
+        false
     }))
+}
+
+/// Clears the blocked exit of a session once its terminal stops running, for
+/// instance after the user confirmed quitting in it.
+fn unblock_exit_when_session_quits(
+    session_id: acp_v2::SessionId,
+    terminal_panel: WeakEntity<TerminalPanel>,
+    label: String,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
+            let still_running = cx.update(|cx| {
+                session_terminal_panel(&session_id, &terminal_panel, cx)
+                    .update(cx, |terminal_panel, cx| {
+                        terminal_panel.has_running_task_terminal(&label, cx)
+                    })
+                    .unwrap_or(false)
+            });
+            if !still_running {
+                break;
+            }
+        }
+        cx.update(|cx| {
+            cx.default_global::<CliSessions>()
+                .blocked_exits
+                .remove(&session_id);
+        });
+    })
+    .detach();
 }
 
 /// Renames the CLI session of a thread. The title shown by the sidebar and
@@ -1980,17 +2035,17 @@ mod tests {
                 )
             })
             .expect("a running session should be asked to quit");
-        let mut quit = false;
+        let mut quit = None;
         for _ in 0..200 {
             cx.executor().advance_clock(SESSION_EXIT_INTERVAL);
             cx.run_until_parked();
-            if (&mut exit).now_or_never().is_some() {
-                quit = true;
+            quit = (&mut exit).now_or_never();
+            if quit.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(quit, "the session should have quit");
+        assert_eq!(quit, Some(true), "the session should have quit");
 
         terminal_panel.update_in(cx, |terminal_panel, window, cx| {
             assert!(!terminal_panel.has_running_task_terminal(&label, cx));
@@ -1999,6 +2054,84 @@ mod tests {
                 "the tab of the session should have been closed"
             );
         });
+        cx.update(|_, cx| assert!(!session_exit_blocked(&session_id, cx)));
+    }
+
+    #[gpui::test]
+    async fn test_exit_session_blocked_until_the_session_quits(cx: &mut TestAppContext) {
+        use futures::FutureExt as _;
+        use gpui::VisualTestContext;
+
+        cx.executor().allow_parking();
+        let app_state = cx.update(workspace::AppState::test);
+        cx.update(|cx| theme_settings::init(theme::LoadThemes::JustBase, cx));
+        let project = project::Project::test(app_state.fs.clone(), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let terminal_panel = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                    workspace.add_panel(panel.clone(), window, cx);
+                    panel
+                })
+            })
+            .expect("the terminal panel should be added");
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let session_id = acp_v2::SessionId::new("5c2e8a41-93d7-4b6f-8e15-a7c0d9f2b364");
+        let label = CliAgent::Claude.resume_label(&session_id);
+        // Ignores `/exit`, like Claude asking to confirm stopping its
+        // background tasks.
+        let task = SpawnInTerminal {
+            full_label: label.clone(),
+            label: label.clone(),
+            command: Some("sh".to_string()),
+            args: vec!["-c".to_string(), "cat > /dev/null".to_string()],
+            ..Default::default()
+        };
+        terminal_panel
+            .update_in(cx, |terminal_panel, window, cx| {
+                terminal_panel.spawn_task(&task, window, cx)
+            })
+            .await
+            .expect("the session terminal should start");
+        cx.run_until_parked();
+
+        let mut exit = cx
+            .update(|window, cx| {
+                exit_session(
+                    &CliAgent::Claude.agent_id(),
+                    &session_id,
+                    std::slice::from_ref(&terminal_panel),
+                    window.window_handle(),
+                    cx,
+                )
+            })
+            .expect("a running session should be asked to quit");
+        let mut quit = None;
+        for _ in 0..=SESSION_EXIT_ATTEMPTS {
+            cx.executor().advance_clock(SESSION_EXIT_INTERVAL);
+            cx.run_until_parked();
+            quit = (&mut exit).now_or_never();
+            if quit.is_some() {
+                break;
+            }
+        }
+        assert_eq!(quit, Some(false), "the session should not have quit");
+        cx.update(|_, cx| assert!(session_exit_blocked(&session_id, cx)));
+        terminal_panel.update(cx, |terminal_panel, cx| {
+            assert!(
+                terminal_panel.has_running_task_terminal(&label, cx),
+                "the terminal of the session should be left alone"
+            );
+        });
+
+        terminal_panel.update_in(cx, |terminal_panel, window, cx| {
+            assert!(terminal_panel.close_task_terminal(&label, window, cx));
+        });
+        cx.executor().advance_clock(STATUS_POLL_INTERVAL);
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!session_exit_blocked(&session_id, cx)));
     }
 
     #[gpui::test]
